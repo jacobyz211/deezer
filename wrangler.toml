@@ -1,0 +1,9 @@
+name = "eclipse-deezer-addon"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+# Override in Cloudflare Dashboard → Workers → Settings → Variables
+# DEEZER_ARL = ""   ← set this for Premium full-track streaming
+
+# Free tier: 100,000 requests/day — more than enough for personal use
