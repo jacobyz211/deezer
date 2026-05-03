@@ -316,7 +316,7 @@ async function handleProxy(trackId, entry, env) {
     // Cache miss — fetch fresh (e.g. direct proxy URL access or cache expired)
     result = await getPremiumStreamInfo(trackId, arl);
   }
-  if (!result?.url) return new Response('Could not get stream URL', { status: 502 });
+  if (!result?.url) return new Response('Track not available for streaming', { status: 404 });
 
   // Fetch the encrypted stream from Deezer CDN
   const encRes = await fetch(result.url, {
@@ -330,7 +330,10 @@ async function handleProxy(trackId, entry, env) {
     }
   });
 
-  if (!encRes.ok) return new Response('CDN fetch failed: ' + encRes.status, { status: 502 });
+  if (!encRes.ok) {
+    console.error(`[proxy] CDN fetch failed: ${encRes.status} for ${result.url.slice(0,80)}`);
+    return new Response('CDN fetch failed: ' + encRes.status, { status: 502 });
+  }
 
   // Read full encrypted buffer
   const encBuffer = await encRes.arrayBuffer();
@@ -530,9 +533,57 @@ async function getPremiumStreamInfo(trackId, arl) {
       }
     }
 
-    // Fallback: CDN reconstruction
+    // CDN URL reconstruction fallback (only if media.deezer.com returned nothing)
     if (!streamUrl) {
-      streamUrl = await buildCDNUrl(MD5_ORIGIN, MEDIA_VERSION, String(SNG_ID || trackId), 3);
+      // Try once more with a fresh dzPing session in case the first token was stale
+      try {
+        const sid2 = await dzPing(arl);
+        const user2 = await dzGw('deezer.getUserData', {}, arl, sid2, 'null');
+        const lt2 = user2?.results?.USER?.OPTIONS?.license_token || null;
+        const list2 = await dzGw('song.getListData', { sng_ids: [String(trackId)] }, arl, sid2, user2?.results?.checkForm || 'null');
+        const song2 = list2?.results?.data?.[0];
+        const tt2 = song2?.TRACK_TOKEN;
+        if (tt2 && lt2) {
+          const mr2 = await fetch('https://media.deezer.com/v1/get_url', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+              'Cookie': `arl=${arl}; sid=${sid2}`,
+              'Origin': 'https://www.deezer.com',
+              'Referer': 'https://www.deezer.com/',
+              'Accept': 'application/json, text/plain, */*',
+            },
+            body: JSON.stringify({
+              license_token: lt2,
+              media: [
+                { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_320' }] },
+                { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
+              ],
+              track_tokens: [tt2],
+            }),
+          });
+          const md2 = await mr2.json();
+          const mediaItems2 = md2?.data?.[0]?.media || [];
+          for (const item of mediaItems2) {
+            const s = item?.sources?.[0]?.url;
+            if (s) {
+              streamUrl = s;
+              const fmt = item.format || 'MP3_320';
+              quality = fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps';
+              console.log(`[premium] retry succeeded: ${streamUrl.slice(0,60)}...`);
+              break;
+            }
+          }
+        }
+      } catch(e2) {
+        console.error('[premium] retry failed:', e2.message);
+      }
+    }
+
+    if (!streamUrl) {
+      console.log('[premium] No stream URL available for track', trackId);
+      return null;
     }
 
     return { url: streamUrl, blowfishKey, quality };
