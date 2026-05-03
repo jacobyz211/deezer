@@ -34,9 +34,9 @@ export default {
 
         const sub = segs.slice(2).join('/');
 
-        if (sub === 'manifest.json')          return handleManifest(token, entry, base);
+        if (sub === 'manifest.json')          return handleManifest(token, entry, base, env);
         if (sub === 'search')                 return handleSearch(url);
-        if (segs[2] === 'stream' && segs[3])  return handleStream(segs[3], entry);
+        if (segs[2] === 'stream' && segs[3])  return handleStream(segs[3], entry, env);
         if (segs[2] === 'album'  && segs[3])  return handleAlbum(segs[3]);
         if (segs[2] === 'artist' && segs[3])  return handleArtist(segs[3]);
         if (segs[2] === 'playlist' && segs[3]) return handlePlaylist(segs[3]);
@@ -97,21 +97,25 @@ async function handleGenerate(request, env, base) {
   }
 
   const token = generateToken();
+  // Store only user-supplied ARL in token — env ARL is always the fallback at stream time
   const entry = { arl: arl || null, createdAt: Date.now() };
   await saveToken(env, token, entry);
 
+  // Premium badge = user has own ARL OR server env ARL is set
+  const isPremium = !!(arl || env.DEEZER_ARL);
   const manifestUrl = `${base}/u/${token}/manifest.json`;
-  return json({ token, manifestUrl, premium: !!arl });
+  return json({ token, manifestUrl, premium: isPremium });
 }
 
 // ─── Manifest ────────────────────────────────────────────────────────────────
-function handleManifest(token, entry, base) {
+function handleManifest(token, entry, base, env) {
+  const hasPremium = !!(entry.arl || env.DEEZER_ARL);
   return json({
     id:          `com.eclipse.deezer.${token.slice(0, 8)}`,
-    name:        entry.arl ? 'Deezer (Premium)' : 'Deezer (Previews)',
+    name:        hasPremium ? 'Deezer (Premium)' : 'Deezer (Previews)',
     version:     '1.0.0',
-    description: entry.arl
-      ? 'Full Deezer streaming via your Premium account.'
+    description: hasPremium
+      ? 'Full Deezer streaming.'
       : 'Deezer search + 30-second previews. Visit the addon page to upgrade to full tracks.',
     icon:        'https://e-cdns-files.dzcdn.net/cache/hack/images/common/favicon/favicon-96x96.png',
     resources:   ['search', 'stream', 'catalog'],
@@ -168,10 +172,11 @@ async function handleSearch(url) {
 }
 
 // ─── Stream ──────────────────────────────────────────────────────────────────
-async function handleStream(trackId, entry) {
-  // Premium: reconstruct full CDN URL via internal Deezer gateway
-  if (entry.arl) {
-    const result = await getFullStreamURL(trackId, entry.arl);
+async function handleStream(trackId, entry, env) {
+  // User's own ARL takes priority; fall back to server env ARL
+  const arl = entry.arl || env.DEEZER_ARL || null;
+  if (arl) {
+    const result = await getFullStreamURL(trackId, arl);
     if (result) return json(result);
   }
   // Free: 30-second official preview
@@ -381,12 +386,12 @@ footer{margin-top:32px;font-size:12px;color:#333;text-align:center;line-height:1
   <h1>Deezer for Eclipse</h1>
   <p class="sub">Generate a URL to add Deezer search and streaming directly into Eclipse Music. No account needed for previews — add your ARL for full tracks.</p>
 
-  <div class="tip"><b>Free mode</b> gives you full search across all of Deezer (tracks, albums, artists, playlists) plus 30-second previews — no login required. <b>Premium mode</b> unlocks full-length 320kbps streams using your Deezer ARL cookie.</div>
+  <div class="tip"><b>Just click Generate</b> — full tracks are already enabled for everyone. Optionally paste <b>your own ARL</b> below to use your personal Deezer account instead.</div>
 
   <div class="lbl">Deezer ARL <span style="color:#3a3a3a;font-weight:400;text-transform:none">(optional — only for full tracks)</span></div>
   <input type="password" id="arlInput" placeholder="Leave blank for free previews — or paste your ARL for full tracks">
   <div class="hint">
-    To get your ARL: log into <a href="https://deezer.com" target="_blank">deezer.com</a>, press <code>F12</code> → Application (Chrome) or Storage (Firefox) → Cookies → <code>https://www.deezer.com</code> → copy the <code>arl</code> value (192-char hex string).
+    Optional — only needed if you want to use <b>your own</b> Deezer account. Log into <a href="https://deezer.com" target="_blank">deezer.com</a>, press <code>F12</code> → Application (Chrome) or Storage (Firefox) → Cookies → <code>https://www.deezer.com</code> → copy the <code>arl</code> value (192-char hex string).
   </div>
 
   <button class="bprimary" id="genBtn" onclick="generate()">Generate My Addon URL</button>
