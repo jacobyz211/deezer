@@ -42,6 +42,13 @@ export default {
         if (segs[2] === 'playlist' && segs[3]) return handlePlaylist(segs[3]);
       }
 
+      if (path === 'health') return json({
+        status: 'ok',
+        version: '1.0.1',
+        arlConfigured: !!(env.DEEZER_ARL),
+        timestamp: new Date().toISOString(),
+      });
+
       return json({ error: 'Not found.' }, 404);
     } catch (e) {
       return json({ error: e.message }, 500);
@@ -249,26 +256,82 @@ async function handlePlaylist(playlistId) {
   });
 }
 
-// ─── Premium stream: internal Deezer gateway + AES-ECB CDN URL ───────────────
+// ─── Premium stream ───────────────────────────────────────────────────────────
+// Strategy:
+//   1. getUserData to get a valid api_token (required for authenticated calls)
+//   2. song.getData to get MD5_ORIGIN + MEDIA_VERSION + TRACK_TOKEN
+//   3. Try media.getUrl (official internal method) with TRACK_TOKEN first
+//   4. Fall back to CDN URL reconstruction if media.getUrl fails
 async function getFullStreamURL(trackId, arl) {
   try {
-    const gwRes = await fetch(
-      'https://www.deezer.com/ajax/gw-light.php?method=song.getData&input=3&api_version=1.0&api_token=null',
-      {
-        method:  'POST',
-        headers: { 'Cookie': `arl=${arl}`, 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ SNG_ID: trackId }),
+    // Step 1: get a real api_token via getUserData
+    const userRes = await dzGw('deezer.getUserData', {}, arl, 'null');
+    const apiToken = userRes?.checkForm || userRes?.USER?.OPTIONS?.license_token || 'null';
+
+    // Step 2: get track data
+    const songRes = await dzGw('song.getData', { SNG_ID: String(trackId) }, arl, apiToken);
+    if (!songRes?.MD5_ORIGIN) {
+      console.error('[stream] song.getData missing MD5_ORIGIN — ARL may be invalid/expired');
+      return null;
+    }
+
+    const { MD5_ORIGIN, MEDIA_VERSION, SNG_ID, TRACK_TOKEN, TRACK_TOKEN_EXPIRE } = songRes;
+
+    // Step 3: try media.getUrl with TRACK_TOKEN (most reliable)
+    if (TRACK_TOKEN) {
+      try {
+        const mediaRes = await fetch('https://media.deezer.com/v1/get_url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Cookie': `arl=${arl}` },
+          body: JSON.stringify({
+            license_token: apiToken,
+            media: [{ type: 'FULL', formats: [
+              { cipher: 'BF_CBC_STRIPE', format: 'MP3_320' },
+              { cipher: 'BF_CBC_STRIPE', format: 'MP3_128' },
+            ]}],
+            track_tokens: [TRACK_TOKEN],
+          }),
+        });
+        const mediaData = await mediaRes.json();
+        const streamUrl = mediaData?.data?.[0]?.media?.[0]?.sources?.[0]?.url;
+        if (streamUrl) {
+          const fmt = mediaData?.data?.[0]?.media?.[0]?.format || 'MP3_320';
+          return { url: streamUrl, format: 'mp3', quality: fmt === 'MP3_320' ? '320kbps' : '128kbps' };
+        }
+      } catch(e) {
+        console.error('[stream] media.getUrl failed:', e.message);
       }
-    );
-    const gwData = await gwRes.json();
-    const r = gwData?.results;
-    if (!r?.MD5_ORIGIN) return null;
-    const url = await buildCDNUrl(r.MD5_ORIGIN, r.MEDIA_VERSION, String(r.SNG_ID), 3);
+    }
+
+    // Step 4: fall back to CDN URL reconstruction
+    const url = await buildCDNUrl(MD5_ORIGIN, MEDIA_VERSION, String(SNG_ID), 3);
     return { url, format: 'mp3', quality: '320kbps' };
+
   } catch (e) {
     console.error('[stream] Premium error:', e.message);
     return null;
   }
+}
+
+// Internal Deezer gateway helper
+async function dzGw(method, params, arl, apiToken) {
+  const res = await fetch(
+    `https://www.deezer.com/ajax/gw-light.php?method=${method}&input=3&api_version=1.0&api_token=${encodeURIComponent(apiToken)}`,
+    {
+      method: 'POST',
+      headers: {
+        'Cookie': `arl=${arl}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify(params),
+    }
+  );
+  const data = await res.json();
+  if (data?.error && Object.keys(data.error).length > 0) {
+    console.error(`[dzGw] ${method} error:`, JSON.stringify(data.error));
+  }
+  return data?.results || null;
 }
 
 async function buildCDNUrl(md5Origin, mediaVersion, trackId, quality) {
@@ -284,9 +347,9 @@ async function buildCDNUrl(md5Origin, mediaVersion, trackId, quality) {
   const blocks = [];
   const paddedBytes = new TextEncoder().encode(padded);
   for (let i = 0; i < paddedBytes.length; i += 16) {
-    const block    = paddedBytes.slice(i, i + 16);
-    const zeroIV   = new Uint8Array(16);
-    const enc      = await crypto.subtle.encrypt({ name: 'AES-CBC', iv: zeroIV }, key, block);
+    const block  = paddedBytes.slice(i, i + 16);
+    const zeroIV = new Uint8Array(16);
+    const enc    = await crypto.subtle.encrypt({ name: 'AES-CBC', iv: zeroIV }, key, block);
     blocks.push(new Uint8Array(enc).slice(0, 16));
   }
   const hexResult = blocks.map(b => Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('')).join('');
