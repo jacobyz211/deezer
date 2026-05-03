@@ -2,7 +2,7 @@
   "name": "eclipse-deezer-addon",
   "version": "1.0.0",
   "description": "Deezer addon for Eclipse Music — Cloudflare Worker",
-  "main": "worker.js",
+  "main": "index.js",
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
