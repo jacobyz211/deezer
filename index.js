@@ -44,10 +44,32 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.0.1',
+        version: '1.0.2',
         arlConfigured: !!(env.DEEZER_ARL),
+        redisConfigured: !!(env.REDIS_URL && env.REDIS_TOKEN),
         timestamp: new Date().toISOString(),
       });
+
+      // Debug route — shows raw Deezer gateway responses for a track ID
+      // Usage: /debug/TRACK_ID  (only works if DEEZER_ARL env is set)
+      if (segs[0] === 'debug' && segs[1] && env.DEEZER_ARL) {
+        const trackId = segs[1];
+        const arl = env.DEEZER_ARL;
+        const userData = await dzGw('deezer.getUserData', {}, arl, 'null');
+        const apiToken = userData?.results?.checkForm || 'null';
+        const licenseToken = userData?.results?.USER?.OPTIONS?.license_token || null;
+        const userId = userData?.results?.USER?.USER_ID || 0;
+        const songData = await dzGw('song.getData', { SNG_ID: String(trackId) }, arl, apiToken);
+        return json({
+          userId,
+          apiToken: apiToken ? apiToken.slice(0, 8) + '...' : null,
+          licenseToken: licenseToken ? licenseToken.slice(0, 8) + '...' : null,
+          arlValid: userId !== 0,
+          hasMD5: !!(songData?.results?.MD5_ORIGIN),
+          hasTrackToken: !!(songData?.results?.TRACK_TOKEN),
+          songError: songData?.error || null,
+        });
+      }
 
       return json({ error: 'Not found.' }, 404);
     } catch (e) {
@@ -59,6 +81,32 @@ export default {
 // ─── In-memory token store (survives within same isolate) ────────────────────
 const TOKEN_CACHE = new Map();
 
+// ─── Upstash Redis (HTTP — works in CF Workers) ───────────────────────────────
+// Set REDIS_URL + REDIS_TOKEN env vars to enable token persistence across isolates.
+// REDIS_URL = your Upstash REST URL (https://xxx.upstash.io)
+async function redisGet(env, key) {
+  if (!env.REDIS_URL || !env.REDIS_TOKEN) return null;
+  try {
+    const r = await fetch(`${env.REDIS_URL}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${env.REDIS_TOKEN}` }
+    });
+    const j = await r.json();
+    return j.result ?? null;
+  } catch { return null; }
+}
+
+async function redisSet(env, key, value, ttlSec) {
+  if (!env.REDIS_URL || !env.REDIS_TOKEN) return;
+  try {
+    const path = ttlSec
+      ? `/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}/ex/${ttlSec}`
+      : `/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`;
+    await fetch(`${env.REDIS_URL}${path}`, {
+      headers: { Authorization: `Bearer ${env.REDIS_TOKEN}` }
+    });
+  } catch {}
+}
+
 function generateToken() {
   const arr = new Uint8Array(14);
   crypto.getRandomValues(arr);
@@ -67,18 +115,27 @@ function generateToken() {
 
 async function getTokenEntry(env, token) {
   if (TOKEN_CACHE.has(token)) return TOKEN_CACHE.get(token);
-  // Try KV persistence if configured
+  // Try Redis persistence
+  const saved = await redisGet(env, 'dz:token:' + token);
+  if (saved) {
+    try {
+      const entry = JSON.parse(saved);
+      TOKEN_CACHE.set(token, entry);
+      return entry;
+    } catch {}
+  }
+  // Try KV fallback
   if (env.DEEZER_KV) {
-    const saved = await env.DEEZER_KV.get('token:' + token);
-    if (saved) {
+    const kv = await env.DEEZER_KV.get('token:' + token);
+    if (kv) {
       try {
-        const entry = JSON.parse(saved);
+        const entry = JSON.parse(kv);
         TOKEN_CACHE.set(token, entry);
         return entry;
       } catch {}
     }
   }
-  // Workers are stateless across isolates — trust any well-formed token
+  // Workers are stateless — trust any well-formed token as a fresh entry
   if (/^[a-f0-9]{28}$/.test(token)) {
     const fresh = { arl: null, createdAt: Date.now() };
     TOKEN_CACHE.set(token, fresh);
@@ -89,6 +146,9 @@ async function getTokenEntry(env, token) {
 
 async function saveToken(env, token, entry) {
   TOKEN_CACHE.set(token, entry);
+  // Persist to Redis (90 day TTL)
+  await redisSet(env, 'dz:token:' + token, JSON.stringify(entry), 86400 * 90);
+  // Also persist to KV if configured
   if (env.DEEZER_KV) {
     await env.DEEZER_KV.put('token:' + token, JSON.stringify(entry), { expirationTtl: 86400 * 90 });
   }
@@ -256,35 +316,67 @@ async function handlePlaylist(playlistId) {
   });
 }
 
+// ─── Internal Deezer gateway helper ─────────────────────────────────────────
+async function dzGw(method, params, arl, apiToken) {
+  const res = await fetch(
+    `https://www.deezer.com/ajax/gw-light.php?method=${method}&input=3&api_version=1.0&api_token=${encodeURIComponent(apiToken || 'null')}`,
+    {
+      method: 'POST',
+      headers: {
+        'Cookie': `arl=${arl}; sid=',';`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': 'https://www.deezer.com',
+        'Referer': 'https://www.deezer.com/',
+      },
+      body: JSON.stringify(params),
+    }
+  );
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { return { _raw: text, _parseError: true }; }
+  return data;
+}
+
 // ─── Premium stream ───────────────────────────────────────────────────────────
-// Strategy:
-//   1. getUserData to get a valid api_token (required for authenticated calls)
-//   2. song.getData to get MD5_ORIGIN + MEDIA_VERSION + TRACK_TOKEN
-//   3. Try media.getUrl (official internal method) with TRACK_TOKEN first
-//   4. Fall back to CDN URL reconstruction if media.getUrl fails
 async function getFullStreamURL(trackId, arl) {
   try {
-    // Step 1: get a real api_token via getUserData
-    const userRes = await dzGw('deezer.getUserData', {}, arl, 'null');
-    const apiToken = userRes?.checkForm || userRes?.USER?.OPTIONS?.license_token || 'null';
+    // Step 1: getUserData to get real api_token + license_token
+    const userData = await dzGw('deezer.getUserData', {}, arl, 'null');
+    const apiToken     = userData?.results?.checkForm || 'null';
+    const licenseToken = userData?.results?.USER?.OPTIONS?.license_token || null;
+    const userId       = userData?.results?.USER?.USER_ID || 0;
 
-    // Step 2: get track data
-    const songRes = await dzGw('song.getData', { SNG_ID: String(trackId) }, arl, apiToken);
-    if (!songRes?.MD5_ORIGIN) {
-      console.error('[stream] song.getData missing MD5_ORIGIN — ARL may be invalid/expired');
-      return null;
+    if (userId === 0) {
+      // ARL is invalid or expired
+      console.error('[stream] userId=0 — ARL is invalid or expired');
+      return { _error: 'ARL invalid or expired', userId, apiToken };
     }
 
-    const { MD5_ORIGIN, MEDIA_VERSION, SNG_ID, TRACK_TOKEN, TRACK_TOKEN_EXPIRE } = songRes;
+    // Step 2: song.getData
+    const songData = await dzGw('song.getData', { SNG_ID: String(trackId) }, arl, apiToken);
+    const song = songData?.results;
 
-    // Step 3: try media.getUrl with TRACK_TOKEN (most reliable)
-    if (TRACK_TOKEN) {
+    if (!song?.MD5_ORIGIN) {
+      console.error('[stream] song.getData failed:', JSON.stringify(songData));
+      return { _error: 'song.getData failed', songData };
+    }
+
+    const { MD5_ORIGIN, MEDIA_VERSION, SNG_ID, TRACK_TOKEN } = song;
+
+    // Step 3: media.deezer.com/v1/get_url with license_token + track_token
+    if (TRACK_TOKEN && licenseToken) {
       try {
         const mediaRes = await fetch('https://media.deezer.com/v1/get_url', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Cookie': `arl=${arl}` },
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+          },
           body: JSON.stringify({
-            license_token: apiToken,
+            license_token: licenseToken,
             media: [{ type: 'FULL', formats: [
               { cipher: 'BF_CBC_STRIPE', format: 'MP3_320' },
               { cipher: 'BF_CBC_STRIPE', format: 'MP3_128' },
@@ -296,42 +388,22 @@ async function getFullStreamURL(trackId, arl) {
         const streamUrl = mediaData?.data?.[0]?.media?.[0]?.sources?.[0]?.url;
         if (streamUrl) {
           const fmt = mediaData?.data?.[0]?.media?.[0]?.format || 'MP3_320';
-          return { url: streamUrl, format: 'mp3', quality: fmt === 'MP3_320' ? '320kbps' : '128kbps' };
+          return { url: streamUrl, format: 'mp3', quality: fmt.includes('320') ? '320kbps' : '128kbps' };
         }
+        console.error('[stream] media.getUrl no url:', JSON.stringify(mediaData));
       } catch(e) {
-        console.error('[stream] media.getUrl failed:', e.message);
+        console.error('[stream] media.getUrl threw:', e.message);
       }
     }
 
-    // Step 4: fall back to CDN URL reconstruction
+    // Step 4: CDN reconstruction fallback
     const url = await buildCDNUrl(MD5_ORIGIN, MEDIA_VERSION, String(SNG_ID), 3);
     return { url, format: 'mp3', quality: '320kbps' };
 
   } catch (e) {
-    console.error('[stream] Premium error:', e.message);
+    console.error('[stream] Unhandled error:', e.message);
     return null;
   }
-}
-
-// Internal Deezer gateway helper
-async function dzGw(method, params, arl, apiToken) {
-  const res = await fetch(
-    `https://www.deezer.com/ajax/gw-light.php?method=${method}&input=3&api_version=1.0&api_token=${encodeURIComponent(apiToken)}`,
-    {
-      method: 'POST',
-      headers: {
-        'Cookie': `arl=${arl}`,
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
-      },
-      body: JSON.stringify(params),
-    }
-  );
-  const data = await res.json();
-  if (data?.error && Object.keys(data.error).length > 0) {
-    console.error(`[dzGw] ${method} error:`, JSON.stringify(data.error));
-  }
-  return data?.results || null;
 }
 
 async function buildCDNUrl(md5Origin, mediaVersion, trackId, quality) {
