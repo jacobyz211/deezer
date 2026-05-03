@@ -1,16 +1,14 @@
 {
   "name": "eclipse-deezer-addon",
   "version": "1.0.0",
-  "description": "Deezer addon for Eclipse Music — free previews + optional Premium full streaming",
-  "main": "index.js",
+  "description": "Deezer addon for Eclipse Music — Cloudflare Worker",
+  "main": "worker.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail"
   },
-  "dependencies": {
-    "axios": "^1.6.0",
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
+  "devDependencies": {
     "wrangler": "^3.0.0"
   }
 }
