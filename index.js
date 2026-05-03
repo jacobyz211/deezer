@@ -55,19 +55,23 @@ export default {
       if (segs[0] === 'debug' && segs[1] && env.DEEZER_ARL) {
         const trackId = segs[1];
         const arl = env.DEEZER_ARL;
-        const userData = await dzGw('deezer.getUserData', {}, arl, 'null');
+        const sid = await dzPing(arl);
+        const userData = await dzGw('deezer.getUserData', {}, arl, sid, 'null');
         const apiToken = userData?.results?.checkForm || 'null';
         const licenseToken = userData?.results?.USER?.OPTIONS?.license_token || null;
         const userId = userData?.results?.USER?.USER_ID || 0;
-        const songData = await dzGw('song.getData', { SNG_ID: String(trackId) }, arl, apiToken);
+        const listData = await dzGw('song.getListData', { sng_ids: [String(trackId)] }, arl, sid, apiToken);
+        const song = listData?.results?.data?.[0];
         return json({
-          userId,
-          apiToken: apiToken ? apiToken.slice(0, 8) + '...' : null,
-          licenseToken: licenseToken ? licenseToken.slice(0, 8) + '...' : null,
-          arlValid: userId !== 0,
-          hasMD5: !!(songData?.results?.MD5_ORIGIN),
-          hasTrackToken: !!(songData?.results?.TRACK_TOKEN),
-          songError: songData?.error || null,
+          step1_sid: sid ? sid.slice(0, 8) + '...' : null,
+          step2_userId: userId,
+          step2_arlValid: userId !== 0,
+          step2_apiToken: apiToken ? apiToken.slice(0, 8) + '...' : null,
+          step2_licenseToken: licenseToken ? licenseToken.slice(0, 8) + '...' : null,
+          step3_hasMD5: !!(song?.MD5_ORIGIN),
+          step3_hasTrackToken: !!(song?.TRACK_TOKEN),
+          step3_trackTokenExpiry: song?.TRACK_TOKEN_EXPIRE || null,
+          step3_error: listData?.error || null,
         });
       }
 
@@ -184,7 +188,7 @@ function handleManifest(token, entry, base, env) {
     description: hasPremium
       ? 'Full Deezer streaming.'
       : 'Deezer search + 30-second previews. Visit the addon page to upgrade to full tracks.',
-    icon:        'https://e-cdns-files.dzcdn.net/cache/hack/images/common/favicon/favicon-96x96.png',
+    icon:        'https://cdn.iconscout.com/icon/free/png-256/free-deezer-logo-icon-svg-download-png-461785.png?f=webp',
     resources:   ['search', 'stream', 'catalog'],
     types:       ['track', 'album', 'artist', 'playlist'],
     contentType: 'music',
@@ -316,16 +320,39 @@ async function handlePlaylist(playlistId) {
   });
 }
 
-// ─── Internal Deezer gateway helper ─────────────────────────────────────────
-async function dzGw(method, params, arl, apiToken) {
+// ─── Internal Deezer gateway ─────────────────────────────────────────────────
+// Confirmed working flow from https://github.com/yne/dzr/issues/5
+// Requires: arl cookie + sid cookie (obtained via deezer.ping first)
+async function dzPing(arl) {
+  // Get a fresh sid session cookie using the arl
+  const res = await fetch(
+    'https://www.deezer.com/ajax/gw-light.php?method=deezer.ping&input=3&api_version=1.0&api_token=null',
+    {
+      method: 'POST',
+      headers: {
+        'Cookie': `arl=${arl}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': 'https://www.deezer.com',
+        'Referer': 'https://www.deezer.com/',
+      },
+      body: '{}',
+    }
+  );
+  const data = await res.json();
+  return data?.results?.SESSION || null;
+}
+
+async function dzGw(method, params, arl, sid, apiToken) {
   const res = await fetch(
     `https://www.deezer.com/ajax/gw-light.php?method=${method}&input=3&api_version=1.0&api_token=${encodeURIComponent(apiToken || 'null')}`,
     {
       method: 'POST',
       headers: {
-        'Cookie': `arl=${arl}; sid=',';`,
+        'Cookie': `arl=${arl}; sid=${sid || ''}`,
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9',
         'Origin': 'https://www.deezer.com',
@@ -335,38 +362,47 @@ async function dzGw(method, params, arl, apiToken) {
     }
   );
   const text = await res.text();
-  let data;
-  try { data = JSON.parse(text); } catch { return { _raw: text, _parseError: true }; }
-  return data;
+  try { return JSON.parse(text); } catch { return { _raw: text.slice(0, 500) }; }
 }
 
 // ─── Premium stream ───────────────────────────────────────────────────────────
+// Based on confirmed working flow: ping → getUserData → song.getListData → media.getUrl
 async function getFullStreamURL(trackId, arl) {
   try {
-    // Step 1: getUserData to get real api_token + license_token
-    const userData = await dzGw('deezer.getUserData', {}, arl, 'null');
-    const apiToken     = userData?.results?.checkForm || 'null';
-    const licenseToken = userData?.results?.USER?.OPTIONS?.license_token || null;
-    const userId       = userData?.results?.USER?.USER_ID || 0;
+    // Step 1: ping to get sid
+    const sid = await dzPing(arl);
 
-    if (userId === 0) {
-      // ARL is invalid or expired
-      console.error('[stream] userId=0 — ARL is invalid or expired');
-      return { _error: 'ARL invalid or expired', userId, apiToken };
+    // Step 2: getUserData with sid → get apiToken + licenseToken + userId
+    const userRaw  = await dzGw('deezer.getUserData', {}, arl, sid, 'null');
+    const apiToken     = userRaw?.results?.checkForm || 'null';
+    const licenseToken = userRaw?.results?.USER?.OPTIONS?.license_token || null;
+    const userId       = userRaw?.results?.USER?.USER_ID || 0;
+
+    if (!userId || userId === 0) {
+      console.error('[stream] ARL invalid/expired — userId=0');
+      return null;
     }
 
-    // Step 2: song.getData
-    const songData = await dzGw('song.getData', { SNG_ID: String(trackId) }, arl, apiToken);
-    const song = songData?.results;
+    // Step 3: song.getListData (more reliable than song.getData for track tokens)
+    const listRaw  = await dzGw('song.getListData', { sng_ids: [String(trackId)] }, arl, sid, apiToken);
+    const song     = listRaw?.results?.data?.[0];
 
-    if (!song?.MD5_ORIGIN) {
-      console.error('[stream] song.getData failed:', JSON.stringify(songData));
-      return { _error: 'song.getData failed', songData };
+    // Fallback to song.getData if getListData fails
+    let finalSong = song;
+    if (!finalSong?.TRACK_TOKEN) {
+      const singleRaw = await dzGw('song.getData', { SNG_ID: String(trackId) }, arl, sid, apiToken);
+      finalSong = singleRaw?.results;
     }
 
-    const { MD5_ORIGIN, MEDIA_VERSION, SNG_ID, TRACK_TOKEN } = song;
+    if (!finalSong?.MD5_ORIGIN) {
+      console.error('[stream] Could not get track data');
+      return null;
+    }
 
-    // Step 3: media.deezer.com/v1/get_url with license_token + track_token
+    const { MD5_ORIGIN, MEDIA_VERSION, SNG_ID, TRACK_TOKEN } = finalSong;
+
+    // Step 4: media.deezer.com/v1/get_url
+    // NOTE: no Cookie header here — only license_token in body
     if (TRACK_TOKEN && licenseToken) {
       try {
         const mediaRes = await fetch('https://media.deezer.com/v1/get_url', {
@@ -374,6 +410,7 @@ async function getFullStreamURL(trackId, arl) {
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+            'Origin': 'https://www.deezer.com',
           },
           body: JSON.stringify({
             license_token: licenseToken,
@@ -390,18 +427,18 @@ async function getFullStreamURL(trackId, arl) {
           const fmt = mediaData?.data?.[0]?.media?.[0]?.format || 'MP3_320';
           return { url: streamUrl, format: 'mp3', quality: fmt.includes('320') ? '320kbps' : '128kbps' };
         }
-        console.error('[stream] media.getUrl no url:', JSON.stringify(mediaData));
+        console.error('[stream] media.getUrl returned no URL:', JSON.stringify(mediaData).slice(0, 300));
       } catch(e) {
-        console.error('[stream] media.getUrl threw:', e.message);
+        console.error('[stream] media.getUrl error:', e.message);
       }
     }
 
-    // Step 4: CDN reconstruction fallback
-    const url = await buildCDNUrl(MD5_ORIGIN, MEDIA_VERSION, String(SNG_ID), 3);
+    // Step 5: CDN reconstruction last resort
+    const url = await buildCDNUrl(MD5_ORIGIN, MEDIA_VERSION, String(SNG_ID || trackId), 3);
     return { url, format: 'mp3', quality: '320kbps' };
 
   } catch (e) {
-    console.error('[stream] Unhandled error:', e.message);
+    console.error('[stream] Fatal:', e.message);
     return null;
   }
 }
