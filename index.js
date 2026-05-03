@@ -114,6 +114,18 @@ export default {
 
 // ─── In-memory token store (survives within same isolate) ────────────────────
 const TOKEN_CACHE = new Map();
+// Short-lived cache: stores resolved {url, blowfishKey, quality} keyed by trackId
+// so /proxy doesn't need to re-call Deezer (TRACK_TOKEN expires in ~30s)
+const STREAM_CACHE = new Map();
+function streamCacheSet(trackId, val) {
+  STREAM_CACHE.set(trackId, { val, exp: Date.now() + 25000 }); // 25s TTL
+}
+function streamCacheGet(trackId) {
+  const e = STREAM_CACHE.get(trackId);
+  if (!e) return null;
+  if (Date.now() > e.exp) { STREAM_CACHE.delete(trackId); return null; }
+  return e.val;
+}
 
 // ─── Upstash Redis (HTTP — works in CF Workers) ───────────────────────────────
 // Set REDIS_URL + REDIS_TOKEN env vars to enable token persistence across isolates.
@@ -277,16 +289,16 @@ async function handleSearch(url) {
 // chunk must be decrypted before playback. We fetch + decrypt + proxy inline.
 async function handleStream(trackId, entry, env, token, base) {
   const arl = entry.arl || (env.DEEZER_ARL || env.DEEZERARL) || null;
-  console.log(`[stream] trackId=${trackId} arlPresent=${!!arl}`);
   if (arl) {
     const result = await getPremiumStreamInfo(trackId, arl);
-    console.log(`[stream] premiumResult=${result ? 'url='+!!result.url+' key='+!!result.blowfishKey : 'NULL'}`);
     if (result?.url && result?.blowfishKey) {
+      // Cache so /proxy can reuse immediately without re-calling Deezer
+      streamCacheSet(trackId, result);
       const proxyUrl = `${base}/u/${token}/proxy/${trackId}`;
       return json({ url: proxyUrl, format: 'mp3', quality: result.quality });
     }
   }
-  console.log(`[stream] FALLBACK to preview — arlPresent=${!!arl}`);
+  // Free: 30-second official preview
   const track = await deezerGet(`/track/${trackId}`);
   if (track?.preview) return json({ url: track.preview, format: 'mp3', quality: 'preview_30s' });
   return json({ error: 'No stream available' }, 404);
@@ -298,13 +310,22 @@ async function handleProxy(trackId, entry, env) {
   const arl = entry.arl || (env.DEEZER_ARL || env.DEEZERARL) || null;
   if (!arl) return new Response('No ARL configured', { status: 403 });
 
-  const result = await getPremiumStreamInfo(trackId, arl);
+  // Use cached result from handleStream to avoid re-calling Deezer (token expires in ~30s)
+  let result = streamCacheGet(trackId);
+  if (!result) {
+    // Cache miss — fetch fresh (e.g. direct proxy URL access or cache expired)
+    result = await getPremiumStreamInfo(trackId, arl);
+  }
   if (!result?.url) return new Response('Could not get stream URL', { status: 502 });
 
   // Fetch the encrypted stream from Deezer CDN
   const encRes = await fetch(result.url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Origin': 'https://www.deezer.com',
+      'Referer': 'https://www.deezer.com/',
       'Range': 'bytes=0-',
     }
   });
@@ -447,12 +468,7 @@ async function getPremiumStreamInfo(trackId, arl) {
     const licenseToken = userRaw?.results?.USER?.OPTIONS?.license_token || null;
     const userId       = userRaw?.results?.USER?.USER_ID || 0;
 
-    const offerName = userRaw?.results?.USER?.OFFER_NAME || 'unknown';
-    console.log(`[premium] userId=${userId} licenseToken=${licenseToken ? licenseToken.slice(0,12)+'...' : 'NULL'} offer=${offerName}`);
-    if (!userId || userId === 0) {
-      console.log('[premium] FAIL: userId=0, ARL invalid or expired');
-      return null;
-    }
+    if (!userId || userId === 0) return null;
 
     const listRaw  = await dzGw('song.getListData', { sng_ids: [String(trackId)] }, arl, sid, apiToken);
     let song       = listRaw?.results?.data?.[0];
@@ -488,22 +504,27 @@ async function getPremiumStreamInfo(trackId, arl) {
           },
           body: JSON.stringify({
             license_token: licenseToken,
-            media: [{ type: 'FULL', formats: [
-              { cipher: 'BF_CBC_STRIPE', format: 'MP3_320' },
-              { cipher: 'BF_CBC_STRIPE', format: 'MP3_128' },
-              { cipher: 'BF_CBC_STRIPE', format: 'MP3_64'  },
-            ]}],
+            media: [
+              { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_320' }] },
+              { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
+              { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_64'  }] },
+            ],
             track_tokens: [TRACK_TOKEN],
           }),
         });
         const mediaData = await mediaRes.json();
-        const src = mediaData?.data?.[0]?.media?.[0]?.sources?.[0]?.url;
-        console.log(`[premium] media.deezer.com errors=${JSON.stringify(mediaData?.errors||null)} srcFound=${!!src}`);
-        if (src) {
-          streamUrl = src;
-          const fmt = mediaData?.data?.[0]?.media?.[0]?.format || 'MP3_320';
-          quality = fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps';
+        // Scan all returned media entries for a valid URL
+        const mediaItems = mediaData?.data?.[0]?.media || [];
+        for (const item of mediaItems) {
+          const s = item?.sources?.[0]?.url;
+          if (s) {
+            streamUrl = s;
+            const fmt = item.format || 'MP3_320';
+            quality = fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps';
+            break;
+          }
         }
+        console.log(`[premium] media.deezer.com srcFound=${!!streamUrl} errors=${JSON.stringify(mediaData?.errors||null)}`);
       } catch(e) {
         console.error('[stream] media.deezer.com error:', e.message);
       }
@@ -511,10 +532,9 @@ async function getPremiumStreamInfo(trackId, arl) {
 
     // Fallback: CDN reconstruction
     if (!streamUrl) {
-      console.log('[premium] Falling back to CDN URL reconstruction');
       streamUrl = await buildCDNUrl(MD5_ORIGIN, MEDIA_VERSION, String(SNG_ID || trackId), 3);
     }
-    console.log(`[premium] streamUrl=${streamUrl ? streamUrl.slice(0,60)+'...' : 'NULL'} quality=${quality}`);
+
     return { url: streamUrl, blowfishKey, quality };
 
   } catch (e) {
