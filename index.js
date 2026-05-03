@@ -36,10 +36,11 @@ export default {
 
         if (sub === 'manifest.json')          return handleManifest(token, entry, base, env);
         if (sub === 'search')                 return handleSearch(url);
-        if (segs[2] === 'stream' && segs[3])  return handleStream(segs[3], entry, env);
+        if (segs[2] === 'stream' && segs[3])  return handleStream(segs[3], entry, env, token, base);
         if (segs[2] === 'album'  && segs[3])  return handleAlbum(segs[3]);
         if (segs[2] === 'artist' && segs[3])  return handleArtist(segs[3]);
         if (segs[2] === 'playlist' && segs[3]) return handlePlaylist(segs[3]);
+        if (segs[2] === 'proxy'    && segs[3]) return handleProxy(segs[3], entry, env);
       }
 
       if (path === 'health') return json({
@@ -188,7 +189,7 @@ function handleManifest(token, entry, base, env) {
     description: hasPremium
       ? 'Full Deezer streaming.'
       : 'Deezer search + 30-second previews. Visit the addon page to upgrade to full tracks.',
-    icon:        'https://cdn.iconscout.com/icon/free/png-256/free-deezer-logo-icon-svg-download-png-461785.png?f=webp',
+    icon:        'https://e-cdns-files.dzcdn.net/cache/hack/images/common/favicon/favicon-96x96.png',
     resources:   ['search', 'stream', 'catalog'],
     types:       ['track', 'album', 'artist', 'playlist'],
     contentType: 'music',
@@ -243,17 +244,62 @@ async function handleSearch(url) {
 }
 
 // ─── Stream ──────────────────────────────────────────────────────────────────
-async function handleStream(trackId, entry, env) {
-  // User's own ARL takes priority; fall back to server env ARL
+// Deezer BF_CBC_STRIPE streams are Blowfish-encrypted — every 3rd 2048-byte
+// chunk must be decrypted before playback. We fetch + decrypt + proxy inline.
+async function handleStream(trackId, entry, env, token, base) {
   const arl = entry.arl || env.DEEZER_ARL || null;
   if (arl) {
-    const result = await getFullStreamURL(trackId, arl);
-    if (result) return json(result);
+    const result = await getPremiumStreamInfo(trackId, arl);
+    if (result?.url && result?.blowfishKey) {
+      // Proxy through our worker so we can decrypt the Blowfish stream inline
+      const proxyUrl = `${base}/u/${token}/proxy/${trackId}`;
+      return json({
+        url: proxyUrl,
+        format: 'mp3',
+        quality: result.quality,
+      });
+    }
   }
   // Free: 30-second official preview
   const track = await deezerGet(`/track/${trackId}`);
   if (track?.preview) return json({ url: track.preview, format: 'mp3', quality: 'preview_30s' });
   return json({ error: 'No stream available' }, 404);
+}
+
+// ─── Proxy route: fetches encrypted stream, decrypts, streams back ────────────
+// Eclipse hits /u/:token/proxy/:trackId — worker fetches from Deezer, decrypts, returns audio
+async function handleProxy(trackId, entry, env) {
+  const arl = entry.arl || env.DEEZER_ARL || null;
+  if (!arl) return new Response('No ARL configured', { status: 403 });
+
+  const result = await getPremiumStreamInfo(trackId, arl);
+  if (!result?.url) return new Response('Could not get stream URL', { status: 502 });
+
+  // Fetch the encrypted stream from Deezer CDN
+  const encRes = await fetch(result.url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+      'Range': 'bytes=0-',
+    }
+  });
+
+  if (!encRes.ok) return new Response('CDN fetch failed: ' + encRes.status, { status: 502 });
+
+  // Read full encrypted buffer
+  const encBuffer = await encRes.arrayBuffer();
+  const encBytes   = new Uint8Array(encBuffer);
+
+  // Decrypt: every 3rd 2048-byte chunk with Blowfish CBC, rest pass-through
+  const decBytes = await decryptBlowfishStream(encBytes, result.blowfishKey);
+
+  return new Response(decBytes, {
+    headers: {
+      'Content-Type': 'audio/mpeg',
+      'Content-Length': String(decBytes.byteLength),
+      'Accept-Ranges': 'bytes',
+      ...CORS,
+    }
+  });
 }
 
 // ─── Album ───────────────────────────────────────────────────────────────────
@@ -365,44 +411,37 @@ async function dzGw(method, params, arl, sid, apiToken) {
   try { return JSON.parse(text); } catch { return { _raw: text.slice(0, 500) }; }
 }
 
-// ─── Premium stream ───────────────────────────────────────────────────────────
-// Based on confirmed working flow: ping → getUserData → song.getListData → media.getUrl
-async function getFullStreamURL(trackId, arl) {
+// ─── Premium stream info ─────────────────────────────────────────────────────
+// Returns { url, blowfishKey, quality } — url is Blowfish-encrypted, must proxy+decrypt
+async function getPremiumStreamInfo(trackId, arl) {
   try {
-    // Step 1: ping to get sid
-    const sid = await dzPing(arl);
-
-    // Step 2: getUserData with sid → get apiToken + licenseToken + userId
-    const userRaw  = await dzGw('deezer.getUserData', {}, arl, sid, 'null');
+    const sid          = await dzPing(arl);
+    const userRaw      = await dzGw('deezer.getUserData', {}, arl, sid, 'null');
     const apiToken     = userRaw?.results?.checkForm || 'null';
     const licenseToken = userRaw?.results?.USER?.OPTIONS?.license_token || null;
     const userId       = userRaw?.results?.USER?.USER_ID || 0;
 
-    if (!userId || userId === 0) {
-      console.error('[stream] ARL invalid/expired — userId=0');
-      return null;
-    }
+    if (!userId || userId === 0) return null;
 
-    // Step 3: song.getListData (more reliable than song.getData for track tokens)
     const listRaw  = await dzGw('song.getListData', { sng_ids: [String(trackId)] }, arl, sid, apiToken);
-    const song     = listRaw?.results?.data?.[0];
+    let song       = listRaw?.results?.data?.[0];
 
-    // Fallback to song.getData if getListData fails
-    let finalSong = song;
-    if (!finalSong?.TRACK_TOKEN) {
+    if (!song?.TRACK_TOKEN) {
       const singleRaw = await dzGw('song.getData', { SNG_ID: String(trackId) }, arl, sid, apiToken);
-      finalSong = singleRaw?.results;
+      song = singleRaw?.results;
     }
 
-    if (!finalSong?.MD5_ORIGIN) {
-      console.error('[stream] Could not get track data');
-      return null;
-    }
+    if (!song?.MD5_ORIGIN) return null;
 
-    const { MD5_ORIGIN, MEDIA_VERSION, SNG_ID, TRACK_TOKEN } = finalSong;
+    const { MD5_ORIGIN, MEDIA_VERSION, SNG_ID, TRACK_TOKEN } = song;
 
-    // Step 4: media.deezer.com/v1/get_url
-    // NOTE: no Cookie header here — only license_token in body
+    // Blowfish key for this track (used to decrypt the stream)
+    const blowfishKey = getBlowfishKey(String(SNG_ID || trackId));
+
+    let streamUrl  = null;
+    let quality    = '320kbps';
+
+    // Try media.deezer.com first
     if (TRACK_TOKEN && licenseToken) {
       try {
         const mediaRes = await fetch('https://media.deezer.com/v1/get_url', {
@@ -422,24 +461,175 @@ async function getFullStreamURL(trackId, arl) {
           }),
         });
         const mediaData = await mediaRes.json();
-        const streamUrl = mediaData?.data?.[0]?.media?.[0]?.sources?.[0]?.url;
-        if (streamUrl) {
-          const fmt = mediaData?.data?.[0]?.media?.[0]?.format || 'MP3_320';
-          return { url: streamUrl, format: 'mp3', quality: fmt.includes('320') ? '320kbps' : '128kbps' };
-        }
-        console.error('[stream] media.getUrl returned no URL:', JSON.stringify(mediaData).slice(0, 300));
+        streamUrl = mediaData?.data?.[0]?.media?.[0]?.sources?.[0]?.url;
+        const fmt = mediaData?.data?.[0]?.media?.[0]?.format || 'MP3_320';
+        quality = fmt.includes('320') ? '320kbps' : '128kbps';
       } catch(e) {
         console.error('[stream] media.getUrl error:', e.message);
       }
     }
 
-    // Step 5: CDN reconstruction last resort
-    const url = await buildCDNUrl(MD5_ORIGIN, MEDIA_VERSION, String(SNG_ID || trackId), 3);
-    return { url, format: 'mp3', quality: '320kbps' };
+    // Fallback: CDN reconstruction
+    if (!streamUrl) {
+      streamUrl = await buildCDNUrl(MD5_ORIGIN, MEDIA_VERSION, String(SNG_ID || trackId), 3);
+    }
+
+    return { url: streamUrl, blowfishKey, quality };
 
   } catch (e) {
     console.error('[stream] Fatal:', e.message);
     return null;
+  }
+}
+
+// ─── Blowfish key derivation (per-track) ─────────────────────────────────────
+function getBlowfishKey(trackId) {
+  const SECRET = 'g4el58wc0zvf9na1';
+  // MD5 of trackId as hex string
+  const h = md5Sync(trackId);
+  let key = '';
+  for (let i = 0; i < 16; i++) {
+    key += String.fromCharCode(
+      h.charCodeAt(i) ^ h.charCodeAt(i + 16) ^ SECRET.charCodeAt(i)
+    );
+  }
+  return key;
+}
+
+// Sync MD5 needed for Blowfish key (pure JS, same algo as the async one)
+function md5Sync(str) {
+  function safeAdd(x,y){const l=(x&0xffff)+(y&0xffff);const m=(x>>16)+(y>>16)+(l>>16);return(m<<16)|(l&0xffff);}
+  function rol(n,c){return(n<<c)|(n>>>(32-c));}
+  function cmn(q,a,b,x,s,t){return safeAdd(rol(safeAdd(safeAdd(a,q),safeAdd(x,t)),s),b);}
+  function ff(a,b,c,d,x,s,t){return cmn((b&c)|(~b&d),a,b,x,s,t);}
+  function gg(a,b,c,d,x,s,t){return cmn((b&d)|(c&~d),a,b,x,s,t);}
+  function hh(a,b,c,d,x,s,t){return cmn(b^c^d,a,b,x,s,t);}
+  function ii(a,b,c,d,x,s,t){return cmn(c^(b|~d),a,b,x,s,t);}
+  const bytes=new TextEncoder().encode(str);
+  const len8=bytes.length;
+  const len32=Math.ceil((len8+9)/64)*16;
+  const M=new Int32Array(len32);
+  for(let i=0;i<len8;i++)M[i>>2]|=bytes[i]<<((i%4)*8);
+  M[len8>>2]|=0x80<<((len8%4)*8);
+  M[len32-2]=len8*8;
+  let a=1732584193,b=-271733879,c=-1732584194,d=271733878;
+  for(let i=0;i<len32;i+=16){
+    const[A,B,C,D]=[a,b,c,d];
+    a=ff(a,b,c,d,M[i+0],7,-680876936);d=ff(d,a,b,c,M[i+1],12,-389564586);c=ff(c,d,a,b,M[i+2],17,606105819);b=ff(b,c,d,a,M[i+3],22,-1044525330);
+    a=ff(a,b,c,d,M[i+4],7,-176418897);d=ff(d,a,b,c,M[i+5],12,1200080426);c=ff(c,d,a,b,M[i+6],17,-1473231341);b=ff(b,c,d,a,M[i+7],22,-45705983);
+    a=ff(a,b,c,d,M[i+8],7,1770035416);d=ff(d,a,b,c,M[i+9],12,-1958414417);c=ff(c,d,a,b,M[i+10],17,-42063);b=ff(b,c,d,a,M[i+11],22,-1990404162);
+    a=ff(a,b,c,d,M[i+12],7,1804603682);d=ff(d,a,b,c,M[i+13],12,-40341101);c=ff(c,d,a,b,M[i+14],17,-1502002290);b=ff(b,c,d,a,M[i+15],22,1236535329);
+    a=gg(a,b,c,d,M[i+1],5,-165796510);d=gg(d,a,b,c,M[i+6],9,-1069501632);c=gg(c,d,a,b,M[i+11],14,643717713);b=gg(b,c,d,a,M[i+0],20,-373897302);
+    a=gg(a,b,c,d,M[i+5],5,-701558691);d=gg(d,a,b,c,M[i+10],9,38016083);c=gg(c,d,a,b,M[i+15],14,-660478335);b=gg(b,c,d,a,M[i+4],20,-405537848);
+    a=gg(a,b,c,d,M[i+9],5,568446438);d=gg(d,a,b,c,M[i+14],9,-1019803690);c=gg(c,d,a,b,M[i+3],14,-187363961);b=gg(b,c,d,a,M[i+8],20,1163531501);
+    a=gg(a,b,c,d,M[i+13],5,-1444681467);d=gg(d,a,b,c,M[i+2],9,-51403784);c=gg(c,d,a,b,M[i+7],14,1735328473);b=gg(b,c,d,a,M[i+12],20,-1926607734);
+    a=hh(a,b,c,d,M[i+5],4,-378558);d=hh(d,a,b,c,M[i+8],11,-2022574463);c=hh(c,d,a,b,M[i+11],16,1839030562);b=hh(b,c,d,a,M[i+14],23,-35309556);
+    a=hh(a,b,c,d,M[i+1],4,-1530992060);d=hh(d,a,b,c,M[i+4],11,1272893353);c=hh(c,d,a,b,M[i+7],16,-155497632);b=hh(b,c,d,a,M[i+10],23,-1094730640);
+    a=hh(a,b,c,d,M[i+13],4,681279174);d=hh(d,a,b,c,M[i+0],11,-358537222);c=hh(c,d,a,b,M[i+3],16,-722521979);b=hh(b,c,d,a,M[i+6],23,76029189);
+    a=hh(a,b,c,d,M[i+9],4,-640364487);d=hh(d,a,b,c,M[i+12],11,-421815835);c=hh(c,d,a,b,M[i+15],16,530742520);b=hh(b,c,d,a,M[i+2],23,-995338651);
+    a=ii(a,b,c,d,M[i+0],6,-198630844);d=ii(d,a,b,c,M[i+7],10,1126891415);c=ii(c,d,a,b,M[i+14],15,-1416354905);b=ii(b,c,d,a,M[i+5],21,-57434055);
+    a=ii(a,b,c,d,M[i+12],6,1700485571);d=ii(d,a,b,c,M[i+3],10,-1894986606);c=ii(c,d,a,b,M[i+10],15,-1051523);b=ii(b,c,d,a,M[i+1],21,-2054922799);
+    a=ii(a,b,c,d,M[i+8],6,1873313359);d=ii(d,a,b,c,M[i+15],10,-30611744);c=ii(c,d,a,b,M[i+6],15,-1560198380);b=ii(b,c,d,a,M[i+13],21,1309151649);
+    a=ii(a,b,c,d,M[i+4],6,-145523070);d=ii(d,a,b,c,M[i+11],10,-1120210379);c=ii(c,d,a,b,M[i+2],15,718787259);b=ii(b,c,d,a,M[i+9],21,-343485551);
+    a=safeAdd(a,A);b=safeAdd(b,B);c=safeAdd(c,C);d=safeAdd(d,D);
+  }
+  return [a,b,c,d].map(n=>{let h='';for(let i=0;i<4;i++)h+=('0'+((n>>(i*8))&0xff).toString(16)).slice(-2);return h;}).join('');
+}
+
+// ─── Blowfish CBC decryption (pure JS, no dependencies) ──────────────────────
+// Deezer streams: every 3rd 2048-byte chunk is BF-CBC encrypted, others are plain
+async function decryptBlowfishStream(encBytes, keyStr) {
+  const CHUNK = 2048;
+  const keyBytes = new TextEncoder().encode(keyStr);
+  const out = new Uint8Array(encBytes.length);
+  const bf  = new Blowfish(keyBytes);
+
+  for (let pos = 0, i = 0; pos < encBytes.length; pos += CHUNK, i++) {
+    const end   = Math.min(pos + CHUNK, encBytes.length);
+    const chunk = encBytes.slice(pos, end);
+    if (i % 3 === 0 && chunk.length === CHUNK) {
+      // Decrypt this chunk: BF-CBC with IV = [0,1,2,3,4,5,6,7]
+      const dec = bf.decryptCBC(chunk, new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]));
+      out.set(dec, pos);
+    } else {
+      out.set(chunk, pos);
+    }
+  }
+  return out;
+}
+
+// ─── Minimal Blowfish CBC implementation ─────────────────────────────────────
+class Blowfish {
+  constructor(key) {
+    this.P = BF_P.slice();
+    this.S = [BF_S0.slice(), BF_S1.slice(), BF_S2.slice(), BF_S3.slice()];
+    let j = 0;
+    for (let i = 0; i < 18; i++) {
+      let data = 0;
+      for (let k = 0; k < 4; k++) {
+        data = (data << 8) | key[j % key.length];
+        j++;
+      }
+      this.P[i] ^= data;
+    }
+    let l = 0, r = 0;
+    for (let i = 0; i < 18; i += 2) {
+      [l, r] = this._encipher(l, r);
+      this.P[i] = l; this.P[i + 1] = r;
+    }
+    for (let s = 0; s < 4; s++) {
+      for (let i = 0; i < 256; i += 2) {
+        [l, r] = this._encipher(l, r);
+        this.S[s][i] = l; this.S[s][i + 1] = r;
+      }
+    }
+  }
+
+  _F(x) {
+    return (((this.S[0][x >>> 24] + this.S[1][(x >>> 16) & 0xff]) ^ this.S[2][(x >>> 8) & 0xff]) + this.S[3][x & 0xff]) >>> 0;
+  }
+
+  _encipher(l, r) {
+    for (let i = 0; i < 16; i++) {
+      l = (l ^ this.P[i]) >>> 0;
+      r = (this._F(l) ^ r) >>> 0;
+      [l, r] = [r, l];
+    }
+    [l, r] = [r, l];
+    r = (r ^ this.P[16]) >>> 0;
+    l = (l ^ this.P[17]) >>> 0;
+    return [l, r];
+  }
+
+  _decipher(l, r) {
+    for (let i = 17; i > 1; i--) {
+      l = (l ^ this.P[i]) >>> 0;
+      r = (this._F(l) ^ r) >>> 0;
+      [l, r] = [r, l];
+    }
+    [l, r] = [r, l];
+    r = (r ^ this.P[1]) >>> 0;
+    l = (l ^ this.P[0]) >>> 0;
+    return [l, r];
+  }
+
+  decryptCBC(data, iv) {
+    const out = new Uint8Array(data.length);
+    let prevL = (iv[0]<<24)|(iv[1]<<16)|(iv[2]<<8)|iv[3];
+    let prevR = (iv[4]<<24)|(iv[5]<<16)|(iv[6]<<8)|iv[7];
+    for (let i = 0; i < data.length; i += 8) {
+      const bl = (data[i]<<24)|(data[i+1]<<16)|(data[i+2]<<8)|data[i+3];
+      const br = (data[i+4]<<24)|(data[i+5]<<16)|(data[i+6]<<8)|data[i+7];
+      let [pl, pr] = this._decipher(bl >>> 0, br >>> 0);
+      pl = (pl ^ prevL) >>> 0;
+      pr = (pr ^ prevR) >>> 0;
+      out[i]   = (pl>>>24)&0xff; out[i+1] = (pl>>>16)&0xff;
+      out[i+2] = (pl>>>8)&0xff;  out[i+3] =  pl&0xff;
+      out[i+4] = (pr>>>24)&0xff; out[i+5] = (pr>>>16)&0xff;
+      out[i+6] = (pr>>>8)&0xff;  out[i+7] =  pr&0xff;
+      prevL = bl >>> 0; prevR = br >>> 0;
+    }
+    return out;
   }
 }
 
