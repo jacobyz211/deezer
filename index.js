@@ -45,13 +45,13 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.0.2',
+        version: '1.1.0',
         arlConfigured: !!(env.DEEZER_ARL),
         redisConfigured: !!(env.REDIS_URL && env.REDIS_TOKEN),
         timestamp: new Date().toISOString(),
       });
 
-      // Debug route — shows raw Deezer gateway responses for a track ID
+      // Debug route — shows full pipeline including media.deezer.com response
       // Usage: /debug/TRACK_ID  (only works if DEEZER_ARL env is set)
       if (segs[0] === 'debug' && segs[1] && env.DEEZER_ARL) {
         const trackId = segs[1];
@@ -63,6 +63,34 @@ export default {
         const userId = userData?.results?.USER?.USER_ID || 0;
         const listData = await dzGw('song.getListData', { sng_ids: [String(trackId)] }, arl, sid, apiToken);
         const song = listData?.results?.data?.[0];
+
+        // Step 4: test media.deezer.com directly with full browser headers
+        let mediaResponse = null;
+        if (song?.TRACK_TOKEN && licenseToken) {
+          try {
+            const mRes = await fetch('https://media.deezer.com/v1/get_url', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+                'Cookie': `arl=${arl}; sid=${sid || ''}`,
+                'Origin': 'https://www.deezer.com',
+                'Referer': 'https://www.deezer.com/',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
+              },
+              body: JSON.stringify({
+                license_token: licenseToken,
+                media: [{ type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_320' }] }],
+                track_tokens: [song.TRACK_TOKEN],
+              }),
+            });
+            mediaResponse = await mRes.json();
+          } catch(e) {
+            mediaResponse = { _error: e.message };
+          }
+        }
+
         return json({
           step1_sid: sid ? sid.slice(0, 8) + '...' : null,
           step2_userId: userId,
@@ -73,6 +101,7 @@ export default {
           step3_hasTrackToken: !!(song?.TRACK_TOKEN),
           step3_trackTokenExpiry: song?.TRACK_TOKEN_EXPIRE || null,
           step3_error: listData?.error || null,
+          step4_mediaResponse: mediaResponse,
         });
       }
 
@@ -185,7 +214,7 @@ function handleManifest(token, entry, base, env) {
   return json({
     id:          `com.eclipse.deezer.${token.slice(0, 8)}`,
     name:        hasPremium ? 'Deezer (Premium)' : 'Deezer (Previews)',
-    version:     '1.0.0',
+    version:     '1.1.0',
     description: hasPremium
       ? 'Full Deezer streaming.'
       : 'Deezer search + 30-second previews. Visit the addon page to upgrade to full tracks.',
@@ -441,7 +470,7 @@ async function getPremiumStreamInfo(trackId, arl) {
     let streamUrl  = null;
     let quality    = '320kbps';
 
-    // Try media.deezer.com first
+    // Try media.deezer.com first — with full browser headers including session cookies
     if (TRACK_TOKEN && licenseToken) {
       try {
         const mediaRes = await fetch('https://media.deezer.com/v1/get_url', {
@@ -449,23 +478,31 @@ async function getPremiumStreamInfo(trackId, arl) {
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+            'Cookie': `arl=${arl}; sid=${sid || ''}`,
             'Origin': 'https://www.deezer.com',
+            'Referer': 'https://www.deezer.com/',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
           },
           body: JSON.stringify({
             license_token: licenseToken,
             media: [{ type: 'FULL', formats: [
               { cipher: 'BF_CBC_STRIPE', format: 'MP3_320' },
               { cipher: 'BF_CBC_STRIPE', format: 'MP3_128' },
+              { cipher: 'BF_CBC_STRIPE', format: 'MP3_64'  },
             ]}],
             track_tokens: [TRACK_TOKEN],
           }),
         });
         const mediaData = await mediaRes.json();
-        streamUrl = mediaData?.data?.[0]?.media?.[0]?.sources?.[0]?.url;
-        const fmt = mediaData?.data?.[0]?.media?.[0]?.format || 'MP3_320';
-        quality = fmt.includes('320') ? '320kbps' : '128kbps';
+        const src = mediaData?.data?.[0]?.media?.[0]?.sources?.[0]?.url;
+        if (src) {
+          streamUrl = src;
+          const fmt = mediaData?.data?.[0]?.media?.[0]?.format || 'MP3_320';
+          quality = fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps';
+        }
       } catch(e) {
-        console.error('[stream] media.getUrl error:', e.message);
+        console.error('[stream] media.deezer.com error:', e.message);
       }
     }
 
@@ -753,12 +790,12 @@ footer{margin-top:32px;font-size:12px;color:#333;text-align:center;line-height:1
   <div class="lbl">Deezer ARL <span style="color:#3a3a3a;font-weight:400;text-transform:none">(optional — only for full tracks)</span></div>
   <input type="password" id="arlInput" placeholder="Leave blank for free previews — or paste your ARL for full tracks">
   <div class="hint">
-    Optional — only needed if you want to use <b>your own</b> Deezer account. Log into <a href="https://deezer.com" target="_blank">deezer.com</a>, press <code>F12</code> → Application (Chrome) or Storage (Firefox) → Cookies → <code>https://www.deezer.com</code> → copy the <code>arl</code> value (192-char hex string).
+    Optional — only needed if you want to use <b>your own</b> Deezer account. Log into <a href="https://deezer.com" target="_blank">deezer.com</a>, press <code>F12</code> \u2192 Application (Chrome) or Storage (Firefox) \u2192 Cookies \u2192 <code>https://www.deezer.com</code> \u2192 copy the <code>arl</code> value (192-char hex string).
   </div>
 
   <button class="bprimary" id="genBtn" onclick="generate()">Generate My Addon URL</button>
   <div class="box" id="genBox">
-    <div class="blbl">Your addon URL — paste into Eclipse <span id="genBadge"></span></div>
+    <div class="blbl">Your addon URL \u2014 paste into Eclipse <span id="genBadge"></span></div>
     <div class="burl" id="genUrl"></div>
     <button class="bcopy" id="copyBtn" onclick="copyUrl()">Copy URL</button>
   </div>
@@ -766,15 +803,15 @@ footer{margin-top:32px;font-size:12px;color:#333;text-align:center;line-height:1
   <hr>
   <div class="steps">
     <div class="step"><div class="sn">1</div><div class="st">Click <b>Generate</b> above and copy your URL</div></div>
-    <div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> → Settings → Connections → Add Connection → Addon</div></div>
+    <div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> \u2192 Settings \u2192 Connections \u2192 Add Connection \u2192 Addon</div></div>
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
-    <div class="step"><div class="sn">4</div><div class="st">Search for any artist, album, or track — Deezer will appear as a source</div></div>
+    <div class="step"><div class="sn">4</div><div class="st">Search for any artist, album, or track \u2014 Deezer will appear as a source</div></div>
   </div>
 
-  <div class="warn">⚠️ ARL tokens are personal and tied to your Deezer account. They expire periodically — if full tracks stop playing, re-grab your ARL and generate a new URL. Never share your ARL publicly.</div>
+  <div class="warn">\u26a0\ufe0f ARL tokens are personal and tied to your Deezer account. They expire periodically \u2014 if full tracks stop playing, re-grab your ARL and generate a new URL. Never share your ARL publicly.</div>
 </div>
 
-<footer>Deezer Eclipse Addon v1.0.0 — <a href="${base}/health" target="_blank" style="color:#333">${base}</a></footer>
+<footer>Deezer Eclipse Addon v1.1.0 \u2014 <a href="${base}/health" target="_blank" style="color:#333">${base}</a></footer>
 
 <script>
 var _url = '';
@@ -791,7 +828,7 @@ function generate() {
     _url = d.manifestUrl;
     document.getElementById('genUrl').textContent = _url;
     document.getElementById('genBadge').innerHTML = d.premium
-      ? '<span class="badge badge-premium">Premium ✦</span>'
+      ? '<span class="badge badge-premium">Premium \u2736</span>'
       : '<span class="badge badge-free">Free Preview</span>';
     document.getElementById('genBox').style.display = 'block';
     btn.disabled = false; btn.textContent = 'Regenerate URL';
