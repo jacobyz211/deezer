@@ -259,7 +259,6 @@ async function handleSearch(url) {
       artworkURL: t.album?.cover_xl || t.album?.cover_big || '',
       isrc:       t.isrc || '',
       format:     'mp3',
-      streamURL:  t.preview || '',  // embed preview so Eclipse can play without extra /stream call
     })),
     albums: (albumsRes.data || []).map(a => ({
       id:         String(a.id),
@@ -533,51 +532,25 @@ async function getPremiumStreamInfo(trackId, arl) {
       }
     }
 
-    // CDN URL reconstruction fallback (only if media.deezer.com returned nothing)
-    if (!streamUrl) {
-      // Try once more with a fresh dzPing session in case the first token was stale
+    // CDN URL reconstruction fallback (when media.deezer.com returns nothing)
+    if (!streamUrl && MD5_ORIGIN && MEDIA_VERSION) {
       try {
-        const sid2 = await dzPing(arl);
-        const user2 = await dzGw('deezer.getUserData', {}, arl, sid2, 'null');
-        const lt2 = user2?.results?.USER?.OPTIONS?.license_token || null;
-        const list2 = await dzGw('song.getListData', { sng_ids: [String(trackId)] }, arl, sid2, user2?.results?.checkForm || 'null');
-        const song2 = list2?.results?.data?.[0];
-        const tt2 = song2?.TRACK_TOKEN;
-        if (tt2 && lt2) {
-          const mr2 = await fetch('https://media.deezer.com/v1/get_url', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
-              'Cookie': `arl=${arl}; sid=${sid2}`,
-              'Origin': 'https://www.deezer.com',
-              'Referer': 'https://www.deezer.com/',
-              'Accept': 'application/json, text/plain, */*',
-            },
-            body: JSON.stringify({
-              license_token: lt2,
-              media: [
-                { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_320' }] },
-                { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
-              ],
-              track_tokens: [tt2],
-            }),
-          });
-          const md2 = await mr2.json();
-          const mediaItems2 = md2?.data?.[0]?.media || [];
-          for (const item of mediaItems2) {
-            const s = item?.sources?.[0]?.url;
-            if (s) {
-              streamUrl = s;
-              const fmt = item.format || 'MP3_320';
-              quality = fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps';
-              console.log(`[premium] retry succeeded: ${streamUrl.slice(0,60)}...`);
-              break;
-            }
+        // Quality preference order: 320 → 128 → 64
+        const qualityMap = { '9': '320kbps', '3': '128kbps', '1': '64kbps' };
+        const qualityCodes = ['9', '3', '1'];
+        for (const qCode of qualityCodes) {
+          const cdnUrl = await buildCDNUrl(MD5_ORIGIN, MEDIA_VERSION, String(SNG_ID || trackId), qCode);
+          // Verify the CDN URL is actually reachable before returning it
+          const headRes = await fetch(cdnUrl, { method: 'HEAD' });
+          if (headRes.ok) {
+            streamUrl = cdnUrl;
+            quality = qualityMap[qCode] || '128kbps';
+            console.log(`[premium] CDN fallback succeeded q=${qCode}: ${cdnUrl.slice(0, 60)}...`);
+            break;
           }
         }
-      } catch(e2) {
-        console.error('[premium] retry failed:', e2.message);
+      } catch (e2) {
+        console.error('[premium] CDN fallback failed:', e2.message);
       }
     }
 
@@ -1068,8 +1041,14 @@ function copyUrl() {
 async function deezerGet(endpoint, params = {}) {
   const u = new URL(`${DEEZER_API}${endpoint}`);
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, String(v));
-  const res = await fetch(u.toString());
-  return res.json();
+  try {
+    const res = await fetch(u.toString());
+    const text = await res.text();
+    return JSON.parse(text);
+  } catch (e) {
+    console.error(`[deezerGet] ${endpoint} failed:`, e.message);
+    return {};
+  }
 }
 
 function json(data, status = 200) {
