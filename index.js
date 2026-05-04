@@ -324,7 +324,7 @@ async function handleProxy(request, trackId, entry, env) {
     return new Response('Track not available for streaming', { status: 404 });
   }
 
-  const { url: cdnUrl, blowfishKey } = result;
+  const { url: cdnUrl, expandedBf } = result;
 
   // Pass Range header through so seeking/partial content works
   const rangeHeader = request.headers.get('Range');
@@ -350,7 +350,6 @@ async function handleProxy(request, trackId, entry, env) {
   }
 
   // Stream-decrypt: buffer incoming bytes, process complete 2048-byte chunks
-  const bfKey = blowfishKey;
   let chunkIndex = Math.floor(byteOffset / 2048); // which 2048-chunk we start at
   let leftover   = new Uint8Array(0);              // incomplete chunk carry-over
 
@@ -366,7 +365,7 @@ async function handleProxy(request, trackId, entry, env) {
         const block = combined.slice(pos, pos + 2048);
         // Every 3rd chunk (0-indexed) is encrypted
         if (chunkIndex % 3 === 0) {
-          controller.enqueue(bfDecryptBlock(block, bfKey));
+          controller.enqueue(bfDecryptBlockFast(block, expandedBf));
         } else {
           controller.enqueue(block);
         }
@@ -386,7 +385,7 @@ async function handleProxy(request, trackId, entry, env) {
   });
 
   // Pipe CDN response body through our decrypt transform
-  cdnRes.body.pipeTo(writable);
+  cdnRes.body.pipeTo(writable).catch(() => {});
 
   const responseHeaders = {
     'Content-Type': 'audio/mpeg',
@@ -449,6 +448,50 @@ function bfDecryptBlock(data, keyStr) {
     out[i+2] = (cl >>> 8)  & 0xff; out[i+3] =  cl         & 0xff;
     out[i+4] = (cr >>> 24) & 0xff; out[i+5] = (cr >>> 16) & 0xff;
     out[i+6] = (cr >>> 8)  & 0xff; out[i+7] =  cr         & 0xff;
+  }
+  return out;
+}
+
+// ─── Pre-expand BF key ONCE per track — cache {P,S}, reuse across all range requests ─
+function bfExpandKey(keyStr) {
+  const keyBytes = new Uint8Array(keyStr.length);
+  for (let i = 0; i < keyStr.length; i++) keyBytes[i] = keyStr.charCodeAt(i);
+  const P = BF_P.slice();
+  const S = [BF_S0.slice(), BF_S1.slice(), BF_S2.slice(), BF_S3.slice()];
+  for (let i = 0; i < 18; i++) {
+    let word = 0;
+    for (let j = 0; j < 4; j++) word = ((word << 8) | keyBytes[(i * 4 + j) % keyBytes.length]) >>> 0;
+    P[i] = (P[i] ^ word) >>> 0;
+  }
+  let l = 0, r = 0;
+  for (let i = 0; i < 18; i += 2) {
+    [l, r] = bfEncrypt(l, r, P, S); P[i] = l; P[i+1] = r;
+  }
+  for (let b = 0; b < 4; b++) {
+    for (let i = 0; i < 256; i += 2) {
+      [l, r] = bfEncrypt(l, r, P, S); S[b][i] = l; S[b][i+1] = r;
+    }
+  }
+  return { P, S };
+}
+
+// ─── Fast BF-CBC decrypt using pre-expanded {P,S} tables — IV=[0,1,2,3,4,5,6,7] ─
+function bfDecryptBlockFast(data, { P, S }) {
+  const out  = new Uint8Array(data.length);
+  let prevL  = 0x00010203 >>> 0;
+  let prevR  = 0x04050607 >>> 0;
+  for (let i = 0; i < data.length; i += 8) {
+    let cl = ((data[i]<<24)|(data[i+1]<<16)|(data[i+2]<<8)|data[i+3]) >>> 0;
+    let cr = ((data[i+4]<<24)|(data[i+5]<<16)|(data[i+6]<<8)|data[i+7]) >>> 0;
+    const origL = cl, origR = cr;
+    [cl, cr] = bfDecrypt(cl, cr, P, S);
+    cl = (cl ^ prevL) >>> 0;
+    cr = (cr ^ prevR) >>> 0;
+    prevL = origL; prevR = origR;
+    out[i]   = (cl>>>24)&0xff; out[i+1] = (cl>>>16)&0xff;
+    out[i+2] = (cl>>>8) &0xff; out[i+3] =  cl      &0xff;
+    out[i+4] = (cr>>>24)&0xff; out[i+5] = (cr>>>16)&0xff;
+    out[i+6] = (cr>>>8) &0xff; out[i+7] =  cr      &0xff;
   }
   return out;
 }
@@ -698,7 +741,9 @@ async function getPremiumStreamInfo(trackId, arl) {
       return null;
     }
 
-    return { url: streamUrl, blowfishKey, quality };
+    // Pre-expand BF key once here — avoids ~5ms key setup on every Range request
+    const expandedBf = bfExpandKey(blowfishKey);
+    return { url: streamUrl, blowfishKey, expandedBf, quality };
 
   } catch (e) {
     console.error('[stream] Fatal:', e.message);
