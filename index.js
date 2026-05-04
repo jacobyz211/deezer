@@ -1,5 +1,5 @@
 // ─── Deezer Eclipse Addon — Cloudflare Worker ────────────────────────────────
-// Free mode:    previews + full search — click Generate, no login needed
+// meow mode:    previews + full search — click Generate, no login needed
 // Premium mode: full 320kbps streams — input your Deezer ARL on the config page
 // ─────────────────────────────────────────────────────────────────────────────
 
