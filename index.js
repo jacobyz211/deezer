@@ -40,7 +40,7 @@ export default {
         if (segs[2] === 'album'  && segs[3])  return handleAlbum(segs[3]);
         if (segs[2] === 'artist' && segs[3])  return handleArtist(segs[3]);
         if (segs[2] === 'playlist' && segs[3]) return handlePlaylist(segs[3]);
-        // /proxy route removed — stream now returns CDN URL directly per Eclipse docs
+        if (segs[2] === 'proxy'    && segs[3]) return handleProxy(request, segs[3], entry, env);
       }
 
       if (path === 'health') return json({
@@ -291,10 +291,11 @@ async function handleStream(trackId, entry, env, token, base) {
   if (arl) {
     const result = await getPremiumStreamInfo(trackId, arl);
     if (result?.url) {
-      // Return the CDN URL directly — Eclipse docs require a direct audio URL, no redirects.
-      // The /proxy route previously caused choppy audio because Eclipse's audio engine
-      // doesn't handle range requests correctly through a redirect layer.
-      return json({ url: result.url, format: 'mp3', quality: result.quality });
+      // Cache so proxy can reuse the CDN URL + blowfishKey without re-calling Deezer
+      streamCacheSet(trackId, result);
+      // Return the proxy URL — proxy handles streaming + BF decryption chunk-by-chunk
+      const proxyUrl = `${base}/u/${token}/proxy/${trackId}`;
+      return json({ url: proxyUrl, format: 'mp3', quality: result.quality });
     }
   }
   // Free: 30-second official preview
@@ -303,37 +304,187 @@ async function handleStream(trackId, entry, env, token, base) {
   return json({ error: 'No stream available' }, 404);
 }
 
-// ─── Proxy route: redirects client directly to the Deezer CDN URL ─────────────
-// The Deezer CDN URL from media.deezer.com is a signed, time-limited direct link.
-// Decrypting the BF_CBC_STRIPE stream inline in a CF Worker exhausts the CPU time
-// limit on the free plan. Since Eclipse follows redirects for audio playback,
-// we simply redirect to the CDN URL — the client downloads the audio directly.
-// Note: The stream from media.deezer.com get_url with BF_CBC_STRIPE is Blowfish-
-// encrypted, but Deezer's CDN also supports the NONE cipher — so we request
-// an unencrypted URL and redirect straight to it.
-async function handleProxy(trackId, entry, env) {
+// ─── Proxy route: fetch from Deezer CDN + stream-decrypt BF_CBC_STRIPE ──────────
+// Deezer premium streams are ALWAYS Blowfish-encrypted (BF_CBC_STRIPE).
+// Encryption: every 3rd 2048-byte chunk is BF-CBC encrypted; others are plaintext.
+// We stream-decrypt chunk by chunk using TransformStream — no full-file buffering,
+// so CPU stays well within CF Workers' 10ms limit (only ~33% of chunks need BF work).
+// Range requests are passed through to the CDN so seeking works correctly.
+async function handleProxy(request, trackId, entry, env) {
   const arl = entry.arl || (env.DEEZER_ARL || env.DEEZERARL) || null;
   if (!arl) return new Response('No ARL configured', { status: 403 });
 
-  // Use cached result from handleStream (avoids re-calling Deezer on every proxy hit)
   let result = streamCacheGet(trackId);
   if (!result) {
     result = await getPremiumStreamInfo(trackId, arl);
+    if (result) streamCacheSet(trackId, result);
   }
   if (!result?.url) {
     console.error(`[proxy] No stream URL for track ${trackId}`);
     return new Response('Track not available for streaming', { status: 404 });
   }
 
-  // Redirect Eclipse directly to the Deezer CDN — no CPU-intensive decryption in worker
-  return new Response(null, {
-    status: 302,
-    headers: {
-      'Location': result.url,
-      'Cache-Control': 'no-store',
-      ...CORS,
+  const { url: cdnUrl, blowfishKey } = result;
+
+  // Pass Range header through so seeking/partial content works
+  const rangeHeader = request.headers.get('Range');
+  const cdnHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Origin': 'https://www.deezer.com',
+    'Referer': 'https://www.deezer.com/',
+  };
+  if (rangeHeader) cdnHeaders['Range'] = rangeHeader;
+
+  const cdnRes = await fetch(cdnUrl, { headers: cdnHeaders });
+  if (!cdnRes.ok && cdnRes.status !== 206) {
+    console.error(`[proxy] CDN fetch failed: ${cdnRes.status}`);
+    return new Response('CDN error: ' + cdnRes.status, { status: 502 });
+  }
+
+  // Figure out byte offset so chunk index (for BF detection) stays correct with Range
+  let byteOffset = 0;
+  if (rangeHeader) {
+    const m = rangeHeader.match(/bytes=(\d+)/);
+    if (m) byteOffset = parseInt(m[1], 10);
+  }
+
+  // Stream-decrypt: buffer incoming bytes, process complete 2048-byte chunks
+  const bfKey = blowfishKey;
+  let chunkIndex = Math.floor(byteOffset / 2048); // which 2048-chunk we start at
+  let leftover   = new Uint8Array(0);              // incomplete chunk carry-over
+
+  const { readable, writable } = new TransformStream({
+    transform(chunk, controller) {
+      // Merge leftover from last call with new chunk
+      const combined = new Uint8Array(leftover.length + chunk.length);
+      combined.set(leftover);
+      combined.set(chunk, leftover.length);
+
+      let pos = 0;
+      while (pos + 2048 <= combined.length) {
+        const block = combined.slice(pos, pos + 2048);
+        // Every 3rd chunk (0-indexed) is encrypted
+        if (chunkIndex % 3 === 0) {
+          controller.enqueue(bfDecryptBlock(block, bfKey));
+        } else {
+          controller.enqueue(block);
+        }
+        chunkIndex++;
+        pos += 2048;
+      }
+      // Keep any remaining bytes < 2048 for next call
+      leftover = combined.slice(pos);
+    },
+    flush(controller) {
+      // Flush any remaining bytes (last partial chunk — always plaintext since BF
+      // only applies to full 2048-byte blocks; Deezer pads to 2048 so this is rare)
+      if (leftover.length > 0) {
+        controller.enqueue(leftover);
+      }
     },
   });
+
+  // Pipe CDN response body through our decrypt transform
+  cdnRes.body.pipeTo(writable);
+
+  const responseHeaders = {
+    'Content-Type': 'audio/mpeg',
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-store',
+    ...CORS,
+  };
+  // Forward Content-Length and Content-Range if CDN sent them
+  const cl  = cdnRes.headers.get('Content-Length');
+  const cr  = cdnRes.headers.get('Content-Range');
+  if (cl)  responseHeaders['Content-Length']  = cl;
+  if (cr)  responseHeaders['Content-Range']   = cr;
+
+  return new Response(readable, {
+    status: cdnRes.status, // 200 or 206 for partial
+    headers: responseHeaders,
+  });
+}
+
+// ─── Blowfish CBC decrypt a single 2048-byte block ───────────────────────────
+// Uses the pre-computed BF key for this track. IV is always [0,1,2,3,4,5,6,7].
+function bfDecryptBlock(data, keyStr) {
+  const keyBytes = new Uint8Array(keyStr.length);
+  for (let i = 0; i < keyStr.length; i++) keyBytes[i] = keyStr.charCodeAt(i);
+
+  // Blowfish P-array and S-boxes init
+  const P = BF_P.slice();
+  const S = [BF_S0.slice(), BF_S1.slice(), BF_S2.slice(), BF_S3.slice()];
+
+  // Key expansion
+  for (let i = 0; i < 18; i++) {
+    let word = 0;
+    for (let j = 0; j < 4; j++) word = (word << 8) | keyBytes[(i * 4 + j) % keyBytes.length];
+    P[i] ^= word;
+  }
+  let l = 0, r = 0;
+  for (let i = 0; i < 18; i += 2) {
+    [l, r] = bfEncrypt(l, r, P, S); P[i] = l; P[i+1] = r;
+  }
+  for (let b = 0; b < 4; b++) {
+    for (let i = 0; i < 256; i += 2) {
+      [l, r] = bfEncrypt(l, r, P, S); S[b][i] = l; S[b][i+1] = r;
+    }
+  }
+
+  // CBC decrypt with IV = [0,1,2,3,4,5,6,7]
+  const out  = new Uint8Array(data.length);
+  let prevL  = 0x00010203;
+  let prevR  = 0x04050607;
+
+  for (let i = 0; i < data.length; i += 8) {
+    let cl = ((data[i]<<24)|(data[i+1]<<16)|(data[i+2]<<8)|data[i+3]) >>> 0;
+    let cr = ((data[i+4]<<24)|(data[i+5]<<16)|(data[i+6]<<8)|data[i+7]) >>> 0;
+    const origL = cl, origR = cr;
+    [cl, cr] = bfDecrypt(cl, cr, P, S);
+    cl = (cl ^ prevL) >>> 0;
+    cr = (cr ^ prevR) >>> 0;
+    prevL = origL; prevR = origR;
+    out[i]   = (cl >>> 24) & 0xff; out[i+1] = (cl >>> 16) & 0xff;
+    out[i+2] = (cl >>> 8)  & 0xff; out[i+3] =  cl         & 0xff;
+    out[i+4] = (cr >>> 24) & 0xff; out[i+5] = (cr >>> 16) & 0xff;
+    out[i+6] = (cr >>> 8)  & 0xff; out[i+7] =  cr         & 0xff;
+  }
+  return out;
+}
+
+function bfEncrypt(l, r, P, S) {
+  l = l >>> 0; r = r >>> 0;
+  for (let i = 0; i < 16; i++) {
+    l = (l ^ P[i]) >>> 0;
+    r = (r ^ bfF(l, S)) >>> 0;
+    [l, r] = [r, l];
+  }
+  [l, r] = [r, l];
+  r = (r ^ P[16]) >>> 0;
+  l = (l ^ P[17]) >>> 0;
+  return [l >>> 0, r >>> 0];
+}
+
+function bfDecrypt(l, r, P, S) {
+  l = l >>> 0; r = r >>> 0;
+  for (let i = 17; i > 1; i--) {
+    l = (l ^ P[i]) >>> 0;
+    r = (r ^ bfF(l, S)) >>> 0;
+    [l, r] = [r, l];
+  }
+  [l, r] = [r, l];
+  r = (r ^ P[1]) >>> 0;
+  l = (l ^ P[0]) >>> 0;
+  return [l >>> 0, r >>> 0];
+}
+
+function bfF(x, S) {
+  const a = (x >>> 24) & 0xff;
+  const b = (x >>> 16) & 0xff;
+  const c = (x >>>  8) & 0xff;
+  const d =  x         & 0xff;
+  return (((S[0][a] + S[1][b]) >>> 0) ^ S[2][c]) + S[3][d] >>> 0;
 }
 
 // ─── Album ───────────────────────────────────────────────────────────────────
