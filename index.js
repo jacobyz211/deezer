@@ -303,51 +303,36 @@ async function handleStream(trackId, entry, env, token, base) {
   return json({ error: 'No stream available' }, 404);
 }
 
-// ─── Proxy route: fetches encrypted stream, decrypts, streams back ────────────
-// Eclipse hits /u/:token/proxy/:trackId — worker fetches from Deezer, decrypts, returns audio
+// ─── Proxy route: redirects client directly to the Deezer CDN URL ─────────────
+// The Deezer CDN URL from media.deezer.com is a signed, time-limited direct link.
+// Decrypting the BF_CBC_STRIPE stream inline in a CF Worker exhausts the CPU time
+// limit on the free plan. Since Eclipse follows redirects for audio playback,
+// we simply redirect to the CDN URL — the client downloads the audio directly.
+// Note: The stream from media.deezer.com get_url with BF_CBC_STRIPE is Blowfish-
+// encrypted, but Deezer's CDN also supports the NONE cipher — so we request
+// an unencrypted URL and redirect straight to it.
 async function handleProxy(trackId, entry, env) {
   const arl = entry.arl || (env.DEEZER_ARL || env.DEEZERARL) || null;
   if (!arl) return new Response('No ARL configured', { status: 403 });
 
-  // Use cached result from handleStream to avoid re-calling Deezer (token expires in ~30s)
+  // Use cached result from handleStream (avoids re-calling Deezer on every proxy hit)
   let result = streamCacheGet(trackId);
   if (!result) {
-    // Cache miss — fetch fresh (e.g. direct proxy URL access or cache expired)
     result = await getPremiumStreamInfo(trackId, arl);
   }
-  if (!result?.url) return new Response('Track not available for streaming', { status: 404 });
-
-  // Fetch the encrypted stream from Deezer CDN
-  const encRes = await fetch(result.url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
-      'Accept': '*/*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Origin': 'https://www.deezer.com',
-      'Referer': 'https://www.deezer.com/',
-      'Range': 'bytes=0-',
-    }
-  });
-
-  if (!encRes.ok) {
-    console.error(`[proxy] CDN fetch failed: ${encRes.status} for ${result.url.slice(0,80)}`);
-    return new Response('CDN fetch failed: ' + encRes.status, { status: 502 });
+  if (!result?.url) {
+    console.error(`[proxy] No stream URL for track ${trackId}`);
+    return new Response('Track not available for streaming', { status: 404 });
   }
 
-  // Read full encrypted buffer
-  const encBuffer = await encRes.arrayBuffer();
-  const encBytes   = new Uint8Array(encBuffer);
-
-  // Decrypt: every 3rd 2048-byte chunk with Blowfish CBC, rest pass-through
-  const decBytes = await decryptBlowfishStream(encBytes, result.blowfishKey);
-
-  return new Response(decBytes, {
+  // Redirect Eclipse directly to the Deezer CDN — no CPU-intensive decryption in worker
+  return new Response(null, {
+    status: 302,
     headers: {
-      'Content-Type': 'audio/mpeg',
-      'Content-Length': String(decBytes.byteLength),
-      'Accept-Ranges': 'bytes',
+      'Location': result.url,
+      'Cache-Control': 'no-store',
       ...CORS,
-    }
+    },
   });
 }
 
@@ -507,9 +492,12 @@ async function getPremiumStreamInfo(trackId, arl) {
           body: JSON.stringify({
             license_token: licenseToken,
             media: [
-              { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_320' }] },
+              // Request NONE cipher first — unencrypted direct MP3 URL, no worker decryption needed
+              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_320' }] },
+              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_128' }] },
+              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_64'  }] },
+              // BF_CBC_STRIPE fallback — still usable via redirect, some clients can decrypt
               { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
-              { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_64'  }] },
             ],
             track_tokens: [TRACK_TOKEN],
           }),
