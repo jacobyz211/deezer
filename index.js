@@ -307,7 +307,7 @@ async function handleStream(trackId, entry, env, token, base) {
 // ─── Proxy route: fetch from Deezer CDN + stream-decrypt BF_CBC_STRIPE ──────────
 // Deezer premium streams are ALWAYS Blowfish-encrypted (BF_CBC_STRIPE).
 // Encryption: every 3rd 2048-byte chunk is BF-CBC encrypted; others are plaintext.
-// We stream-decrypt chunk by chunk using TransformStream — no full-file buffering,
+// We stream-decrypt chunk by chunk using an async ReadableStream — no full-file buffering,
 // so CPU stays well within CF Workers' 10ms limit (only ~33% of chunks need BF work).
 // Range requests are passed through to the CDN so seeking works correctly.
 async function handleProxy(request, trackId, entry, env) {
@@ -349,43 +349,61 @@ async function handleProxy(request, trackId, entry, env) {
     if (m) byteOffset = parseInt(m[1], 10);
   }
 
-  // Stream-decrypt: buffer incoming bytes, process complete 2048-byte chunks
-  let chunkIndex = Math.floor(byteOffset / 2048); // which 2048-chunk we start at
-  let leftover   = new Uint8Array(0);              // incomplete chunk carry-over
+  // Stream-decrypt: async pull-based ReadableStream to stay within CF Workers 10ms CPU limit.
+  // TransformStream processes chunks synchronously — when iOS sends large range requests
+  // (e.g. bytes=102400-5377042) the old while-loop would decrypt hundreds of BF blocks
+  // in one synchronous burst, exceeding the 10ms CPU wall and triggering exceededCpu.
+  // Fix: read from CDN body async, yield via setTimeout(0) every MAX_BF_BLOCKS_PER_TICK
+  // encrypted blocks so CF runtime slices CPU across multiple microtask ticks.
+  const MAX_BF_BLOCKS_PER_TICK = 8; // 8 × 2048 = 16 KB per tick, safe under 10ms
 
-  const { readable, writable } = new TransformStream({
-    transform(chunk, controller) {
-      // Merge leftover from last call with new chunk
-      const combined = new Uint8Array(leftover.length + chunk.length);
-      combined.set(leftover);
-      combined.set(chunk, leftover.length);
+  let chunkIndex = Math.floor(byteOffset / 2048);
+  let leftover   = new Uint8Array(0);
 
-      let pos = 0;
-      while (pos + 2048 <= combined.length) {
-        const block = combined.slice(pos, pos + 2048);
-        // Every 3rd chunk (0-indexed) is encrypted
-        if (chunkIndex % 3 === 0) {
-          controller.enqueue(bfDecryptBlockFast(block, expandedBf));
-        } else {
-          controller.enqueue(block);
+  async function processBuffer(buf, controller) {
+    let pos = 0;
+    let batchCount = 0;
+    while (pos + 2048 <= buf.length) {
+      const block = buf.slice(pos, pos + 2048);
+      if (chunkIndex % 3 === 0) {
+        controller.enqueue(bfDecryptBlockFast(block, expandedBf));
+        batchCount++;
+        if (batchCount >= MAX_BF_BLOCKS_PER_TICK) {
+          await new Promise(r => setTimeout(r, 0));
+          batchCount = 0;
         }
-        chunkIndex++;
-        pos += 2048;
+      } else {
+        controller.enqueue(block);
       }
-      // Keep any remaining bytes < 2048 for next call
-      leftover = combined.slice(pos);
-    },
-    flush(controller) {
-      // Flush any remaining bytes (last partial chunk — always plaintext since BF
-      // only applies to full 2048-byte blocks; Deezer pads to 2048 so this is rare)
-      if (leftover.length > 0) {
-        controller.enqueue(leftover);
-      }
-    },
-  });
+      chunkIndex++;
+      pos += 2048;
+    }
+    leftover = buf.slice(pos);
+  }
 
-  // Pipe CDN response body through our decrypt transform
-  cdnRes.body.pipeTo(writable).catch(() => {});
+  const readable = new ReadableStream({
+    async start(controller) {
+      const reader = cdnRes.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const combined = new Uint8Array(leftover.length + value.length);
+          combined.set(leftover);
+          combined.set(value, leftover.length);
+          await processBuffer(combined, controller);
+        }
+        // Flush leftover (last partial block — always plaintext, BF only on full 2048-byte blocks)
+        if (leftover.length > 0) controller.enqueue(leftover);
+        controller.close();
+      } catch (e) {
+        controller.error(e);
+      } finally {
+        reader.releaseLock();
+      }
+    },
+    cancel() {}
+  });
 
   const responseHeaders = {
     'Content-Type': 'audio/mpeg',
