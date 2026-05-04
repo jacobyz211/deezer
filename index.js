@@ -40,7 +40,7 @@ export default {
         if (segs[2] === 'album'  && segs[3])  return handleAlbum(segs[3]);
         if (segs[2] === 'artist' && segs[3])  return handleArtist(segs[3]);
         if (segs[2] === 'playlist' && segs[3]) return handlePlaylist(segs[3]);
-        if (segs[2] === 'proxy'    && segs[3]) return handleProxy(segs[3], entry, env);
+        // /proxy route removed — stream now returns CDN URL directly per Eclipse docs
       }
 
       if (path === 'health') return json({
@@ -290,11 +290,11 @@ async function handleStream(trackId, entry, env, token, base) {
   const arl = entry.arl || (env.DEEZER_ARL || env.DEEZERARL) || null;
   if (arl) {
     const result = await getPremiumStreamInfo(trackId, arl);
-    if (result?.url && result?.blowfishKey) {
-      // Cache so /proxy can reuse immediately without re-calling Deezer
-      streamCacheSet(trackId, result);
-      const proxyUrl = `${base}/u/${token}/proxy/${trackId}`;
-      return json({ url: proxyUrl, format: 'mp3', quality: result.quality });
+    if (result?.url) {
+      // Return the CDN URL directly — Eclipse docs require a direct audio URL, no redirects.
+      // The /proxy route previously caused choppy audio because Eclipse's audio engine
+      // doesn't handle range requests correctly through a redirect layer.
+      return json({ url: result.url, format: 'mp3', quality: result.quality });
     }
   }
   // Free: 30-second official preview
