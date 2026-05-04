@@ -405,8 +405,9 @@ async function handleProxy(request, trackId, entry, env) {
     cancel() {}
   });
 
+  const isFlac = result.quality === 'hifi_flac';
   const responseHeaders = {
-    'Content-Type': 'audio/mpeg',
+    'Content-Type': isFlac ? 'audio/flac' : 'audio/mpeg',
     'Accept-Ranges': 'bytes',
     'Cache-Control': 'no-store',
     ...CORS,
@@ -704,11 +705,13 @@ async function getPremiumStreamInfo(trackId, arl) {
           body: JSON.stringify({
             license_token: licenseToken,
             media: [
-              // Request NONE cipher first — unencrypted direct MP3 URL, no worker decryption needed
+              // HiFi FLAC — requires Deezer HiFi subscription, gracefully skipped if not available
+              { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'FLAC' }] },
+              // High quality MP3 — NONE cipher = unencrypted direct URL, no worker decryption needed
               { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_320' }] },
               { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_128' }] },
               { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_64'  }] },
-              // BF_CBC_STRIPE fallback — still usable via redirect, some clients can decrypt
+              // BF_CBC_STRIPE fallback
               { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
             ],
             track_tokens: [TRACK_TOKEN],
@@ -722,7 +725,10 @@ async function getPremiumStreamInfo(trackId, arl) {
           if (s) {
             streamUrl = s;
             const fmt = item.format || 'MP3_320';
-            quality = fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps';
+            quality = fmt === 'FLAC'        ? 'hifi_flac'
+                    : fmt.includes('320')   ? '320kbps'
+                    : fmt.includes('128')   ? '128kbps'
+                    : '64kbps';
             break;
           }
         }
