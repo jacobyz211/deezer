@@ -45,7 +45,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.2.0',
+        version: '1.1.0',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -117,8 +117,12 @@ const TOKEN_CACHE = new Map();
 // Short-lived cache: stores resolved {url, blowfishKey, quality} keyed by trackId
 // so /proxy doesn't need to re-call Deezer (TRACK_TOKEN expires in ~30s)
 const STREAM_CACHE = new Map();
+// Long-lived BF key cache — pre-expanded keys persist 10min independent of stream URL expiry
+const BF_KEY_CACHE = new Map();
+function bfKeyCacheSet(trackId, expandedBf) { BF_KEY_CACHE.set(trackId, { expandedBf, exp: Date.now() + 600000 }); }
+function bfKeyCacheGet(trackId) { const e = BF_KEY_CACHE.get(trackId); if (!e) return null; if (Date.now() > e.exp) { BF_KEY_CACHE.delete(trackId); return null; } return e.expandedBf; }
 function streamCacheSet(trackId, val) {
-  STREAM_CACHE.set(trackId, { val, exp: Date.now() + 25000 }); // 25s TTL
+  STREAM_CACHE.set(trackId, { val, exp: Date.now() + 300000 }); // 5min TTL — keeps BF key alive across seeks
 }
 function streamCacheGet(trackId) {
   const e = STREAM_CACHE.get(trackId);
@@ -226,7 +230,7 @@ function handleManifest(token, entry, base, env) {
   return json({
     id:          `com.eclipse.deezer.${token.slice(0, 8)}`,
     name:        hasPremium ? 'Deezer (Premium)' : 'Deezer (Previews)',
-    version:     '1.2.0',
+    version:     '1.1.0',
     description: hasPremium
       ? 'Full Deezer streaming.'
       : 'Deezer search + 30-second previews. Visit the addon page to upgrade to full tracks.',
@@ -266,7 +270,7 @@ async function handleSearch(url) {
       artist:     a.artist?.name || '',
       artworkURL: a.cover_xl || a.cover_big || '',
       trackCount: a.nb_tracks || 0,
-      year:       a.release_date ? String(a.release_date).slice(0, 4) : '',
+      year:       a.release_date ? parseInt(String(a.release_date).slice(0, 4), 10) : 0,
     })),
     artists: (artistsRes.data || []).map(a => ({
       id:         String(a.id),
@@ -293,6 +297,8 @@ async function handleStream(trackId, entry, env, token, base) {
     if (result?.url) {
       // Cache so proxy can reuse the CDN URL + blowfishKey without re-calling Deezer
       streamCacheSet(trackId, result);
+      // Also persist expanded BF key separately — survives stream URL TTL for seeks
+      if (result.expandedBf) bfKeyCacheSet(trackId, result.expandedBf);
       // Return the proxy URL — proxy handles streaming + BF decryption chunk-by-chunk
       const proxyUrl = `${base}/u/${token}/proxy/${trackId}`;
       return json({ url: proxyUrl, format: 'mp3', quality: result.quality });
@@ -307,44 +313,36 @@ async function handleStream(trackId, entry, env, token, base) {
 // ─── Proxy route: fetch from Deezer CDN + stream-decrypt BF_CBC_STRIPE ──────────
 // Deezer premium streams are ALWAYS Blowfish-encrypted (BF_CBC_STRIPE).
 // Encryption: every 3rd 2048-byte chunk is BF-CBC encrypted; others are plaintext.
-// We stream-decrypt chunk by chunk using an async ReadableStream — no full-file buffering,
+// We stream-decrypt chunk by chunk using TransformStream — no full-file buffering,
 // so CPU stays well within CF Workers' 10ms limit (only ~33% of chunks need BF work).
 // Range requests are passed through to the CDN so seeking works correctly.
 async function handleProxy(request, trackId, entry, env) {
   const arl = entry.arl || (env.DEEZER_ARL || env.DEEZERARL) || null;
   if (!arl) return new Response('No ARL configured', { status: 403 });
 
-  // Handle HEAD requests (iOS AVPlayer preflight) — return headers without body
-  if (request.method === 'HEAD') {
-    let result = streamCacheGet(trackId);
-    if (!result) {
-      result = await getPremiumStreamInfo(trackId, arl);
-      if (result) streamCacheSet(trackId, result);
-    }
-    if (!result?.url) return new Response(null, { status: 404, headers: CORS });
-    const isFlac = result.quality === 'hifi_flac';
-    return new Response(null, {
-      status: 200,
-      headers: {
-        'Content-Type': isFlac ? 'audio/flac' : 'audio/mpeg',
-        'Accept-Ranges': 'bytes',
-        'Cache-Control': 'no-store',
-        ...CORS,
-      },
-    });
-  }
-
   let result = streamCacheGet(trackId);
   if (!result) {
     result = await getPremiumStreamInfo(trackId, arl);
-    if (result) streamCacheSet(trackId, result);
+    if (result) {
+      streamCacheSet(trackId, result);
+      // Cache expanded BF key separately so seeks don't need to re-expand
+      if (result.expandedBf) bfKeyCacheSet(trackId, result.expandedBf);
+    }
   }
   if (!result?.url) {
     console.error(`[proxy] No stream URL for track ${trackId}`);
     return new Response('Track not available for streaming', { status: 404 });
   }
 
-  const { url: cdnUrl, expandedBf } = result;
+  const { url: cdnUrl } = result;
+  // Prefer cached expanded BF key — avoids expensive re-expansion on every Range/seek request
+  const expandedBf = result.expandedBf || bfKeyCacheGet(trackId);
+  if (!expandedBf) {
+    console.error(`[proxy] No BF decryption key for track ${trackId} — forcing stream refresh`);
+    // Clear cache to force fresh stream info on retry
+    STREAM_CACHE.delete(trackId);
+    return new Response('Decryption key unavailable, please retry', { status: 503 });
+  }
 
   // Pass Range header through so seeking/partial content works
   const rangeHeader = request.headers.get('Range');
@@ -369,71 +367,46 @@ async function handleProxy(request, trackId, entry, env) {
     if (m) byteOffset = parseInt(m[1], 10);
   }
 
-  // Stream-decrypt: async pull-based ReadableStream to stay within CF Workers 10ms CPU limit.
-  // If stream cipher is NONE (unencrypted), pass CDN body through directly — no BF work needed.
-  // TransformStream processes chunks synchronously — when iOS sends large range requests
-  // (e.g. bytes=102400-5377042) the old while-loop would decrypt hundreds of BF blocks
-  // in one synchronous burst, exceeding the 10ms CPU wall and triggering exceededCpu.
-  // Fix: read from CDN body async, yield via setTimeout(0) every MAX_BF_BLOCKS_PER_TICK
-  // encrypted blocks so CF runtime slices CPU across multiple microtask ticks.
-  const MAX_BF_BLOCKS_PER_TICK = 8; // 8 × 2048 = 16 KB per tick, safe under 10ms
+  // Stream-decrypt: buffer incoming bytes, process complete 2048-byte chunks
+  let chunkIndex = Math.floor(byteOffset / 2048); // which 2048-chunk we start at
+  let leftover   = new Uint8Array(0);              // incomplete chunk carry-over
 
-  // For unencrypted (NONE cipher) streams, pipe CDN body directly — zero decryption overhead
-  const readable = result.needsDecrypt === false
-    ? cdnRes.body
-    : (() => {
-  let chunkIndex = Math.floor(byteOffset / 2048);
-  let leftover   = new Uint8Array(0);
+  const { readable, writable } = new TransformStream({
+    transform(chunk, controller) {
+      // Merge leftover from last call with new chunk
+      const combined = new Uint8Array(leftover.length + chunk.length);
+      combined.set(leftover);
+      combined.set(chunk, leftover.length);
 
-  async function processBuffer(buf, controller) {
-    let pos = 0;
-    let batchCount = 0;
-    while (pos + 2048 <= buf.length) {
-      const block = buf.slice(pos, pos + 2048);
-      if (chunkIndex % 3 === 0) {
-        controller.enqueue(bfDecryptBlockFast(block, expandedBf));
-        batchCount++;
-        if (batchCount >= MAX_BF_BLOCKS_PER_TICK) {
-          await new Promise(r => setTimeout(r, 0));
-          batchCount = 0;
+      let pos = 0;
+      while (pos + 2048 <= combined.length) {
+        const block = combined.slice(pos, pos + 2048);
+        // Every 3rd chunk (0-indexed) is encrypted
+        if (chunkIndex % 3 === 0) {
+          controller.enqueue(bfDecryptBlockFast(block, expandedBf));
+        } else {
+          controller.enqueue(block);
         }
-      } else {
-        controller.enqueue(block);
+        chunkIndex++;
+        pos += 2048;
       }
-      chunkIndex++;
-      pos += 2048;
-    }
-    leftover = buf.slice(pos);
-  }
-
-  return new ReadableStream({
-    async start(controller) {
-      const reader = cdnRes.body.getReader();
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const combined = new Uint8Array(leftover.length + value.length);
-          combined.set(leftover);
-          combined.set(value, leftover.length);
-          await processBuffer(combined, controller);
-        }
-        // Flush leftover (last partial block — always plaintext, BF only on full 2048-byte blocks)
-        if (leftover.length > 0) controller.enqueue(leftover);
-        controller.close();
-      } catch (e) {
-        controller.error(e);
-      } finally {
-        reader.releaseLock();
+      // Keep any remaining bytes < 2048 for next call
+      leftover = combined.slice(pos);
+    },
+    flush(controller) {
+      // Flush any remaining bytes (last partial chunk — always plaintext since BF
+      // only applies to full 2048-byte blocks; Deezer pads to 2048 so this is rare)
+      if (leftover.length > 0) {
+        controller.enqueue(leftover);
       }
     },
-    cancel() {}
   });
-  })();
 
-  const isFlac = result.quality === 'hifi_flac';
+  // Pipe CDN response body through our decrypt transform
+  cdnRes.body.pipeTo(writable).catch(() => {});
+
   const responseHeaders = {
-    'Content-Type': isFlac ? 'audio/flac' : 'audio/mpeg',
+    'Content-Type': 'audio/mpeg',
     'Accept-Ranges': 'bytes',
     'Cache-Control': 'no-store',
     ...CORS,
@@ -583,7 +556,7 @@ async function handleAlbum(albumId) {
     title:      data.title,
     artist:     data.artist?.name || '',
     artworkURL: data.cover_xl || data.cover_big || '',
-    year:       data.release_date ? String(data.release_date).slice(0, 4) : '',
+    year:       data.release_date ? parseInt(String(data.release_date).slice(0, 4), 10) : 0,
     trackCount: data.nb_tracks,
     tracks: (data.tracks?.data || []).map(t => ({
       id:         String(t.id),
@@ -617,7 +590,7 @@ async function handleArtist(artistId) {
       id: String(a.id), title: a.title, artist: artist.name,
       artworkURL: a.cover_xl || a.cover_big || '',
       trackCount: a.nb_tracks || 0,
-      year: a.release_date ? String(a.release_date).slice(0, 4) : '',
+      year: a.release_date ? parseInt(String(a.release_date).slice(0, 4), 10) : 0,
     })),
   });
 }
@@ -713,7 +686,6 @@ async function getPremiumStreamInfo(trackId, arl) {
 
     let streamUrl  = null;
     let quality    = '320kbps';
-    let streamCipher = 'BF_CBC_STRIPE'; // assume encrypted unless proven otherwise
 
     // Try media.deezer.com first — with full browser headers including session cookies
     if (TRACK_TOKEN && licenseToken) {
@@ -732,13 +704,11 @@ async function getPremiumStreamInfo(trackId, arl) {
           body: JSON.stringify({
             license_token: licenseToken,
             media: [
-              // HiFi FLAC — requires Deezer HiFi subscription, gracefully skipped if not available
-              { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'FLAC' }] },
-              // High quality MP3 — NONE cipher = unencrypted direct URL, no worker decryption needed
+              // Request NONE cipher first — unencrypted direct MP3 URL, no worker decryption needed
               { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_320' }] },
               { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_128' }] },
               { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_64'  }] },
-              // BF_CBC_STRIPE fallback
+              // BF_CBC_STRIPE fallback — still usable via redirect, some clients can decrypt
               { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
             ],
             track_tokens: [TRACK_TOKEN],
@@ -752,12 +722,7 @@ async function getPremiumStreamInfo(trackId, arl) {
           if (s) {
             streamUrl = s;
             const fmt = item.format || 'MP3_320';
-            quality = fmt === 'FLAC'        ? 'hifi_flac'
-                    : fmt.includes('320')   ? '320kbps'
-                    : fmt.includes('128')   ? '128kbps'
-                    : '64kbps';
-            // Track whether this stream is encrypted (BF_CBC_STRIPE) or plain (NONE)
-            streamCipher = item.cipher || 'BF_CBC_STRIPE';
+            quality = fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps';
             break;
           }
         }
@@ -796,9 +761,7 @@ async function getPremiumStreamInfo(trackId, arl) {
 
     // Pre-expand BF key once here — avoids ~5ms key setup on every Range request
     const expandedBf = bfExpandKey(blowfishKey);
-    // Only pass expandedBf when stream is actually BF-encrypted
-    const needsDecrypt = streamCipher !== 'NONE';
-    return { url: streamUrl, blowfishKey, expandedBf: needsDecrypt ? expandedBf : null, quality, needsDecrypt };
+    return { url: streamUrl, blowfishKey, expandedBf, quality };
 
   } catch (e) {
     console.error('[stream] Fatal:', e.message);
