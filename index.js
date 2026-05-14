@@ -45,7 +45,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.5.2',
+        version: '1.5.3',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -307,14 +307,22 @@ async function handleStream(trackId, entry, env, token, base) {
   if (arl) {
     const result = await getPremiumStreamInfo(trackId, arl, env);
     if (result?.url) {
-      // Cache so proxy can reuse the CDN URL + blowfishKey without re-calling Deezer
       streamCacheSet(trackId, result);
-      // Also persist expanded BF key separately — survives stream URL TTL for seeks
-      // v1.5.2: bfKeyCacheSet skipped — NONE cipher only
-      // Return the proxy URL — proxy handles streaming + BF decryption chunk-by-chunk
-      const proxyUrl  = `${base}/u/${token}/proxy/${trackId}`;
-      // v1.5.0: return real format + expiresAt
       const streamFmt = result.quality === 'flac' ? 'flac' : 'mp3';
+      // v1.5.3: BF_CBC_STRIPE → return CDN URL directly + blowfishKey for client-side decrypt
+      //         NONE cipher   → return proxy URL (plain pipe, no decrypt needed)
+      if (result.cipher === 'BF_CBC_STRIPE') {
+        return json({
+          url:          result.url,
+          format:       streamFmt,
+          quality:      result.quality,
+          key:          result.blowfishKey,
+          cipher:       'BF_CBC_STRIPE',
+          expiresAt:    result.expiresAt,
+        });
+      }
+      // NONE cipher — proxy pipe
+      const proxyUrl = `${base}/u/${token}/proxy/${trackId}`;
       return json({ url: proxyUrl, format: streamFmt, quality: result.quality, expiresAt: result.expiresAt });
     }
   }
@@ -734,11 +742,13 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
           body: JSON.stringify({
             license_token: licenseToken,
             media: [
-              // v1.5.2: NONE cipher only — BF decrypt is too CPU-heavy for CF free plan
-              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'FLAC'    }] },
-              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_320' }] },
-              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_128' }] },
-              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_64'  }] },
+              // v1.5.3: BF_CBC_STRIPE first (what most accounts have rights to), NONE fallback
+              { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'FLAC'    }] },
+              { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_320' }] },
+              { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_320' }] },
+              { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'FLAC'    }] },
+              { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
+              { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_128' }] },
             ],
             track_tokens: [TRACK_TOKEN],
           }),
