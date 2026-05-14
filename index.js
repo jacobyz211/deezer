@@ -45,7 +45,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.1.0',
+        version: '1.2.0',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -121,6 +121,18 @@ const STREAM_CACHE = new Map();
 const BF_KEY_CACHE = new Map();
 function bfKeyCacheSet(trackId, expandedBf) { BF_KEY_CACHE.set(trackId, { expandedBf, exp: Date.now() + 600000 }); }
 function bfKeyCacheGet(trackId) { const e = BF_KEY_CACHE.get(trackId); if (!e) return null; if (Date.now() > e.exp) { BF_KEY_CACHE.delete(trackId); return null; } return e.expandedBf; }
+
+// ─── ARL session cache (sid + apiToken + licenseToken) — 10 min TTL ──────────
+// Avoids 3 serial Deezer gateway round-trips (ping+getUserData+getListData) per play
+const SESSION_CACHE = new Map();
+function sessionCacheSet(arlKey, val) { SESSION_CACHE.set(arlKey, { val, exp: Date.now() + 600000 }); }
+function sessionCacheGet(arlKey) {
+  const e = SESSION_CACHE.get(arlKey);
+  if (!e) return null;
+  if (Date.now() > e.exp) { SESSION_CACHE.delete(arlKey); return null; }
+  return e.val;
+}
+
 function streamCacheSet(trackId, val) {
   STREAM_CACHE.set(trackId, { val, exp: Date.now() + 300000 }); // 5min TTL — keeps BF key alive across seeks
 }
@@ -230,7 +242,7 @@ function handleManifest(token, entry, base, env) {
   return json({
     id:          `com.eclipse.deezer.${token.slice(0, 8)}`,
     name:        hasPremium ? 'Deezer (Premium)' : 'Deezer (Previews)',
-    version:     '1.1.0',
+    version:     '1.2.0',
     description: hasPremium
       ? 'Full Deezer streaming.'
       : 'Deezer search + 30-second previews. Visit the addon page to upgrade to full tracks.',
@@ -335,11 +347,10 @@ async function handleProxy(request, trackId, entry, env) {
   }
 
   const { url: cdnUrl } = result;
-  // Prefer cached expanded BF key — avoids expensive re-expansion on every Range/seek request
+  // For BF_CBC_STRIPE streams: need expanded key. For NONE: expandedBf will be null (that's fine).
   const expandedBf = result.expandedBf || bfKeyCacheGet(trackId);
-  if (!expandedBf) {
+  if (!expandedBf && result.cipher !== 'NONE') {
     console.error(`[proxy] No BF decryption key for track ${trackId} — forcing stream refresh`);
-    // Clear cache to force fresh stream info on retry
     STREAM_CACHE.delete(trackId);
     return new Response('Decryption key unavailable, please retry', { status: 503 });
   }
@@ -360,20 +371,39 @@ async function handleProxy(request, trackId, entry, env) {
     return new Response('CDN error: ' + cdnRes.status, { status: 502 });
   }
 
-  // Figure out byte offset so chunk index (for BF detection) stays correct with Range
+  const responseHeaders = {
+    'Content-Type': 'audio/mpeg',
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-store',
+    ...CORS,
+  };
+  const cl  = cdnRes.headers.get('Content-Length');
+  const cr  = cdnRes.headers.get('Content-Range');
+  if (cl)  responseHeaders['Content-Length']  = cl;
+  if (cr)  responseHeaders['Content-Range']   = cr;
+
+  // ── NONE cipher: stream is plaintext — pipe directly, no decryption ───────
+  if (result.cipher === 'NONE' || !expandedBf) {
+    console.log(`[proxy] NONE cipher stream for track ${trackId} — piping directly`);
+    return new Response(cdnRes.body, {
+      status: cdnRes.status,
+      headers: responseHeaders,
+    });
+  }
+
+  // ── BF_CBC_STRIPE: stream-decrypt every 3rd 2048-byte chunk ──────────────
+  // Figure out byte offset so chunk index stays correct with Range requests
   let byteOffset = 0;
   if (rangeHeader) {
     const m = rangeHeader.match(/bytes=(\d+)/);
     if (m) byteOffset = parseInt(m[1], 10);
   }
 
-  // Stream-decrypt: buffer incoming bytes, process complete 2048-byte chunks
-  let chunkIndex = Math.floor(byteOffset / 2048); // which 2048-chunk we start at
-  let leftover   = new Uint8Array(0);              // incomplete chunk carry-over
+  let chunkIndex = Math.floor(byteOffset / 2048);
+  let leftover   = new Uint8Array(0);
 
   const { readable, writable } = new TransformStream({
     transform(chunk, controller) {
-      // Merge leftover from last call with new chunk
       const combined = new Uint8Array(leftover.length + chunk.length);
       combined.set(leftover);
       combined.set(chunk, leftover.length);
@@ -381,7 +411,6 @@ async function handleProxy(request, trackId, entry, env) {
       let pos = 0;
       while (pos + 2048 <= combined.length) {
         const block = combined.slice(pos, pos + 2048);
-        // Every 3rd chunk (0-indexed) is encrypted
         if (chunkIndex % 3 === 0) {
           controller.enqueue(bfDecryptBlockFast(block, expandedBf));
         } else {
@@ -390,35 +419,19 @@ async function handleProxy(request, trackId, entry, env) {
         chunkIndex++;
         pos += 2048;
       }
-      // Keep any remaining bytes < 2048 for next call
       leftover = combined.slice(pos);
     },
     flush(controller) {
-      // Flush any remaining bytes (last partial chunk — always plaintext since BF
-      // only applies to full 2048-byte blocks; Deezer pads to 2048 so this is rare)
       if (leftover.length > 0) {
         controller.enqueue(leftover);
       }
     },
   });
 
-  // Pipe CDN response body through our decrypt transform
   cdnRes.body.pipeTo(writable).catch(() => {});
 
-  const responseHeaders = {
-    'Content-Type': 'audio/mpeg',
-    'Accept-Ranges': 'bytes',
-    'Cache-Control': 'no-store',
-    ...CORS,
-  };
-  // Forward Content-Length and Content-Range if CDN sent them
-  const cl  = cdnRes.headers.get('Content-Length');
-  const cr  = cdnRes.headers.get('Content-Range');
-  if (cl)  responseHeaders['Content-Length']  = cl;
-  if (cr)  responseHeaders['Content-Range']   = cr;
-
   return new Response(readable, {
-    status: cdnRes.status, // 200 or 206 for partial
+    status: cdnRes.status,
     headers: responseHeaders,
   });
 }
@@ -661,11 +674,23 @@ async function dzGw(method, params, arl, sid, apiToken) {
 // Returns { url, blowfishKey, quality } — url is Blowfish-encrypted, must proxy+decrypt
 async function getPremiumStreamInfo(trackId, arl) {
   try {
-    const sid          = await dzPing(arl);
-    const userRaw      = await dzGw('deezer.getUserData', {}, arl, sid, 'null');
-    const apiToken     = userRaw?.results?.checkForm || 'null';
-    const licenseToken = userRaw?.results?.USER?.OPTIONS?.license_token || null;
-    const userId       = userRaw?.results?.USER?.USER_ID || 0;
+    // ── Session cache: skip 3 serial Deezer gateway round-trips if warm ────
+    const arlKey = arl.slice(0, 16); // use prefix as cache key (never store full ARL)
+    let session = sessionCacheGet(arlKey);
+    let sid, apiToken, licenseToken, userId;
+
+    if (session) {
+      ({ sid, apiToken, licenseToken, userId } = session);
+    } else {
+      sid          = await dzPing(arl);
+      const userRaw = await dzGw('deezer.getUserData', {}, arl, sid, 'null');
+      apiToken     = userRaw?.results?.checkForm || 'null';
+      licenseToken = userRaw?.results?.USER?.OPTIONS?.license_token || null;
+      userId       = userRaw?.results?.USER?.USER_ID || 0;
+      if (userId && userId !== 0) {
+        sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
+      }
+    }
 
     if (!userId || userId === 0) return null;
 
@@ -685,6 +710,7 @@ async function getPremiumStreamInfo(trackId, arl) {
     const blowfishKey = getBlowfishKey(String(SNG_ID || trackId));
 
     let streamUrl  = null;
+    let streamCipher = 'BF_CBC_STRIPE'; // default assumption — override below
     let quality    = '320kbps';
 
     // Try media.deezer.com first — with full browser headers including session cookies
@@ -708,44 +734,52 @@ async function getPremiumStreamInfo(trackId, arl) {
               { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_320' }] },
               { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_128' }] },
               { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_64'  }] },
-              // BF_CBC_STRIPE fallback — still usable via redirect, some clients can decrypt
+              // BF_CBC_STRIPE fallback — still usable via proxy+decrypt
               { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
             ],
             track_tokens: [TRACK_TOKEN],
           }),
         });
         const mediaData = await mediaRes.json();
-        // Scan all returned media entries for a valid URL
+        // Scan all returned media entries for a valid URL — capture cipher type too
         const mediaItems = mediaData?.data?.[0]?.media || [];
         for (const item of mediaItems) {
           const s = item?.sources?.[0]?.url;
           if (s) {
-            streamUrl = s;
+            streamUrl    = s;
+            streamCipher = item?.cipher?.type || item?.format?.includes?.('BF') ? 'BF_CBC_STRIPE' : 'NONE';
+            // More reliable: check the format field from our request array
+            if (item.format) {
+              streamCipher = 'NONE'; // We requested NONE first — if we got a URL from the NONE formats it's plaintext
+              // But if it came from the BF fallback entry, mark it accordingly
+              // The safest heuristic: check if cipher object exists
+              if (item.cipher && item.cipher.type === 'BF_CBC_STRIPE') streamCipher = 'BF_CBC_STRIPE';
+            }
             const fmt = item.format || 'MP3_320';
             quality = fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps';
             break;
           }
         }
-        console.log(`[premium] media.deezer.com srcFound=${!!streamUrl} errors=${JSON.stringify(mediaData?.errors||null)}`);
+        console.log(`[premium] media.deezer.com srcFound=${!!streamUrl} cipher=${streamCipher} errors=${JSON.stringify(mediaData?.errors||null)}`);
       } catch(e) {
         console.error('[stream] media.deezer.com error:', e.message);
       }
     }
 
     // CDN URL reconstruction fallback (when media.deezer.com returns nothing)
+    // CDN URLs are always BF_CBC_STRIPE encrypted
     if (!streamUrl && MD5_ORIGIN && MEDIA_VERSION) {
       try {
-        // Quality preference order: 320 → 128 → 64
         const qualityMap = { '9': '320kbps', '3': '128kbps', '1': '64kbps' };
         const qualityCodes = ['9', '3', '1'];
         for (const qCode of qualityCodes) {
           const cdnUrl = await buildCDNUrl(MD5_ORIGIN, MEDIA_VERSION, String(SNG_ID || trackId), qCode);
-          // Verify the CDN URL is actually reachable before returning it
           const headRes = await fetch(cdnUrl, { method: 'HEAD' });
           if (headRes.ok) {
-            streamUrl = cdnUrl;
+            streamUrl    = cdnUrl;
+            streamCipher = 'BF_CBC_STRIPE'; // CDN URLs are always encrypted
             quality = qualityMap[qCode] || '128kbps';
-            console.log(`[premium] CDN fallback succeeded q=${qCode}: ${cdnUrl.slice(0, 60)}...`);
+            console.log(`[premium] CDN fallback succeeded q=${qCode} cipher=BF_CBC_STRIPE: ${cdnUrl.slice(0, 60)}...`);
             break;
           }
         }
@@ -759,9 +793,9 @@ async function getPremiumStreamInfo(trackId, arl) {
       return null;
     }
 
-    // Pre-expand BF key once here — avoids ~5ms key setup on every Range request
-    const expandedBf = bfExpandKey(blowfishKey);
-    return { url: streamUrl, blowfishKey, expandedBf, quality };
+    // Pre-expand BF key once here — only needed for BF_CBC_STRIPE streams
+    const expandedBf = (streamCipher === 'BF_CBC_STRIPE') ? bfExpandKey(blowfishKey) : null;
+    return { url: streamUrl, cipher: streamCipher, blowfishKey, expandedBf, quality };
 
   } catch (e) {
     console.error('[stream] Fatal:', e.message);
@@ -1204,7 +1238,7 @@ footer{margin-top:32px;font-size:12px;color:#333;text-align:center;line-height:1
   <div class="warn">\u26a0\ufe0f ARL tokens are personal and tied to your Deezer account. They expire periodically \u2014 if full tracks stop playing, re-grab your ARL and generate a new URL. Never share your ARL publicly.</div>
 </div>
 
-<footer>Deezer Eclipse Addon v1.1.0 \u2014 <a href="${base}/health" target="_blank" style="color:#333">${base}</a></footer>
+<footer>Deezer Eclipse Addon v1.2.0 \u2014 <a href="${base}/health" target="_blank" style="color:#333">${base}</a></footer>
 
 <script>
 var _url = '';
