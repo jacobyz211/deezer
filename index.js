@@ -45,7 +45,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.5.1',
+        version: '1.5.2',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -310,7 +310,7 @@ async function handleStream(trackId, entry, env, token, base) {
       // Cache so proxy can reuse the CDN URL + blowfishKey without re-calling Deezer
       streamCacheSet(trackId, result);
       // Also persist expanded BF key separately — survives stream URL TTL for seeks
-      if (result.expandedBf) bfKeyCacheSet(trackId, result.expandedBf);
+      // v1.5.2: bfKeyCacheSet skipped — NONE cipher only
       // Return the proxy URL — proxy handles streaming + BF decryption chunk-by-chunk
       const proxyUrl  = `${base}/u/${token}/proxy/${trackId}`;
       // v1.5.0: return real format + expiresAt
@@ -339,7 +339,7 @@ async function handleProxy(request, trackId, entry, env) {
     result = await getPremiumStreamInfo(trackId, arl, env);
     if (result) {
       streamCacheSet(trackId, result);
-      if (result.expandedBf) bfKeyCacheSet(trackId, result.expandedBf);
+      // v1.5.2: bfKeyCacheSet skipped — NONE cipher only
     }
   }
   if (!result?.url) {
@@ -371,13 +371,8 @@ async function handleProxy(request, trackId, entry, env) {
   }
 
   const { url: cdnUrl } = result;
-  // For BF_CBC_STRIPE streams: need expanded key. For NONE: expandedBf will be null (that's fine).
-  const expandedBf = result.expandedBf || bfKeyCacheGet(trackId);
-  if (!expandedBf && result.cipher !== 'NONE') {
-    console.error(`[proxy] No BF decryption key for track ${trackId} — forcing stream refresh`);
-    STREAM_CACHE.delete(trackId);
-    return new Response('Decryption key unavailable, please retry', { status: 503 });
-  }
+  // v1.5.2: All streams are NONE cipher — no BF key expansion needed
+  const expandedBf = null; // kept for BF fallback 302 path only
 
   // Pass the exact Range header from the client through unchanged — never cap it.
   // CF Workers CPU limit applies per synchronous JS turn, NOT to total streaming time.
@@ -417,56 +412,19 @@ async function handleProxy(request, trackId, entry, env) {
   if (cl)  responseHeaders['Content-Length']  = cl;
   if (cr)  responseHeaders['Content-Range']   = cr;
 
-  // ── NONE cipher: stream is plaintext — pipe directly, no decryption ───────
+  // v1.5.2: Primary path — NONE cipher, pipe CDN bytes directly to client
   if (result.cipher === 'NONE' || !expandedBf) {
-    console.log(`[proxy] NONE cipher — piping track ${trackId} directly`);
     return new Response(cdnRes.body, {
       status: cdnRes.status,
       headers: responseHeaders,
     });
   }
 
-  // ── BF_CBC_STRIPE: stream-decrypt every 3rd 2048-byte chunk ──────────────
-  // chunkIndex tracks which 2048-byte block we're at globally so we know which to decrypt.
-  // Network delivers data in small chunks (~16-64KB), so each transform() call only does
-  // a handful of BF block operations — well within the 10ms CPU-per-turn budget.
-  let chunkIndex = Math.floor(byteStart / 2048);
-  let leftover   = new Uint8Array(0);
-
-  const { readable, writable } = new TransformStream({
-    transform(chunk, controller) {
-      // Merge leftover bytes from previous call with new incoming chunk
-      const buf = new Uint8Array(leftover.length + chunk.length);
-      buf.set(leftover);
-      buf.set(chunk, leftover.length);
-
-      let pos = 0;
-      while (pos + 2048 <= buf.length) {
-        const block = buf.subarray(pos, pos + 2048);
-        // Every 3rd chunk (0, 3, 6, ...) is BF-encrypted; the rest are plaintext
-        if (chunkIndex % 3 === 0) {
-          controller.enqueue(bfDecryptBlockFast(block, expandedBf));
-        } else {
-          controller.enqueue(new Uint8Array(block)); // copy to avoid shared buffer issues
-        }
-        chunkIndex++;
-        pos += 2048;
-      }
-      // Keep incomplete tail for next call
-      leftover = buf.slice(pos);
-    },
-    flush(controller) {
-      // Final partial block — always plaintext, flush as-is
-      if (leftover.length > 0) controller.enqueue(leftover);
-    },
-  });
-
-  cdnRes.body.pipeTo(writable).catch(() => {});
-
-  return new Response(readable, {
-    status: cdnRes.status,
-    headers: responseHeaders,
-  });
+  // v1.5.2: BF_CBC_STRIPE decrypt removed — too CPU-heavy for CF free plan (10ms limit).
+  // All streams are requested as NONE cipher so this path should never be reached.
+  // If somehow a BF stream slips through (e.g. CDN fallback), redirect client to CDN directly.
+  console.warn(`[proxy] BF_CBC_STRIPE stream for track ${trackId} — issuing 302 to CDN`);
+  return Response.redirect(cdnUrl, 302);
 }
 
 // ─── Blowfish CBC decrypt a single 2048-byte block ───────────────────────────
@@ -734,8 +692,8 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
       try {
         const cached = JSON.parse(cachedStream);
         if (cached?.url) {
-          const expandedBfCached = (cached.cipher === 'BF_CBC_STRIPE') ? bfExpandKey(cached.blowfishKey || getBlowfishKey(String(trackId))) : null;
-          return { ...cached, expandedBf: expandedBfCached };
+          // v1.5.2: No BF key expansion — NONE cipher only
+          return { ...cached, expandedBf: null };
         }
       } catch {}
     }
@@ -776,13 +734,11 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
           body: JSON.stringify({
             license_token: licenseToken,
             media: [
-              // v1.5.1: FLAC with NONE cipher — no BF decrypt needed, avoids CPU limit
+              // v1.5.2: NONE cipher only — BF decrypt is too CPU-heavy for CF free plan
               { type: 'FULL', formats: [{ cipher: 'NONE', format: 'FLAC'    }] },
-              { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_320' }] },
-              { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_128' }] },
-              { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_64'  }] },
-              // BF_CBC_STRIPE fallback
-              { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
+              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_320' }] },
+              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_128' }] },
+              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_64'  }] },
             ],
             track_tokens: [TRACK_TOKEN],
           }),
@@ -831,8 +787,8 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
     // v1.5.0: write to Redis (4min TTL) so other isolates reuse same URL
     await redisSet(env_ref, `dz:stream:${trackId}`, JSON.stringify({ url: streamUrl, cipher: streamCipher, blowfishKey, quality }), 240);
 
-    // Pre-expand BF key once here — only needed for BF_CBC_STRIPE streams
-    const expandedBf = (streamCipher === 'BF_CBC_STRIPE') ? bfExpandKey(blowfishKey) : null;
+    // v1.5.2: Skip bfExpandKey — NONE cipher, no decrypt in Worker
+    const expandedBf = null;
     const expiresAt  = Date.now() + 240_000;
     return { url: streamUrl, cipher: streamCipher, blowfishKey, expandedBf, quality, expiresAt };
 
