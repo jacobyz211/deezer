@@ -45,7 +45,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.5.0',
+        version: '1.5.1',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -339,13 +339,35 @@ async function handleProxy(request, trackId, entry, env) {
     result = await getPremiumStreamInfo(trackId, arl, env);
     if (result) {
       streamCacheSet(trackId, result);
-      // Cache expanded BF key separately so seeks don't need to re-expand
       if (result.expandedBf) bfKeyCacheSet(trackId, result.expandedBf);
     }
   }
   if (!result?.url) {
     console.error(`[proxy] No stream URL for track ${trackId}`);
     return new Response('Track not available for streaming', { status: 404 });
+  }
+
+  // v1.5.1: Handle HEAD requests cheaply — just proxy CDN HEAD, no BF work
+  if (request.method === 'HEAD') {
+    const headRes = await fetch(result.url, {
+      method: 'HEAD',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+        'Accept': '*/*', 'Accept-Encoding': 'identity',
+        'Origin': 'https://www.deezer.com', 'Referer': 'https://www.deezer.com/',
+      },
+    });
+    const h = {
+      'Content-Type': result.quality === 'flac' ? 'audio/flac' : 'audio/mpeg',
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'no-store',
+      ...CORS,
+    };
+    const cl = headRes.headers.get('Content-Length');
+    const cr = headRes.headers.get('Content-Range');
+    if (cl) h['Content-Length'] = cl;
+    if (cr) h['Content-Range']  = cr;
+    return new Response(null, { status: headRes.ok ? 200 : headRes.status, headers: h });
   }
 
   const { url: cdnUrl } = result;
@@ -754,8 +776,8 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
           body: JSON.stringify({
             license_token: licenseToken,
             media: [
-              // v1.5.0: FLAC first, then MP3 fallbacks
-              { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'FLAC'    }] },
+              // v1.5.1: FLAC with NONE cipher — no BF decrypt needed, avoids CPU limit
+              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'FLAC'    }] },
               { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_320' }] },
               { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_128' }] },
               { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_64'  }] },
@@ -788,23 +810,14 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
       }
     }
 
-    // CDN URL reconstruction fallback (when media.deezer.com returns nothing)
-    // CDN URLs are always BF_CBC_STRIPE encrypted
+    // CDN URL reconstruction fallback — skip HEAD probes to save CPU, try 320 first
     if (!streamUrl && MD5_ORIGIN && MEDIA_VERSION) {
       try {
-        const qualityMap = { '9': '320kbps', '3': '128kbps', '1': '64kbps' };
-        const qualityCodes = ['9', '3', '1'];
-        for (const qCode of qualityCodes) {
-          const cdnUrl = await buildCDNUrl(MD5_ORIGIN, MEDIA_VERSION, String(SNG_ID || trackId), qCode);
-          const headRes = await fetch(cdnUrl, { method: 'HEAD' });
-          if (headRes.ok) {
-            streamUrl    = cdnUrl;
-            streamCipher = 'BF_CBC_STRIPE'; // CDN URLs are always encrypted
-            quality = qualityMap[qCode] || '128kbps';
-            console.log(`[premium] CDN fallback succeeded q=${qCode} cipher=BF_CBC_STRIPE: ${cdnUrl.slice(0, 60)}...`);
-            break;
-          }
-        }
+        // Try 320 first without HEAD probe — if CDN returns 403/404 the client will retry
+        streamUrl    = await buildCDNUrl(MD5_ORIGIN, MEDIA_VERSION, String(SNG_ID || trackId), '9');
+        streamCipher = 'BF_CBC_STRIPE';
+        quality      = '320kbps';
+        console.log(`[premium] CDN fallback (no probe): ${streamUrl.slice(0, 60)}...`);
       } catch (e2) {
         console.error('[premium] CDN fallback failed:', e2.message);
       }
