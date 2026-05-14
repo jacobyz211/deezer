@@ -45,7 +45,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.4.0',
+        version: '1.5.0',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -305,15 +305,17 @@ async function handleSearch(url) {
 async function handleStream(trackId, entry, env, token, base) {
   const arl = entry.arl || (env.DEEZER_ARL || env.DEEZERARL) || null;
   if (arl) {
-    const result = await getPremiumStreamInfo(trackId, arl);
+    const result = await getPremiumStreamInfo(trackId, arl, env);
     if (result?.url) {
       // Cache so proxy can reuse the CDN URL + blowfishKey without re-calling Deezer
       streamCacheSet(trackId, result);
       // Also persist expanded BF key separately — survives stream URL TTL for seeks
       if (result.expandedBf) bfKeyCacheSet(trackId, result.expandedBf);
       // Return the proxy URL — proxy handles streaming + BF decryption chunk-by-chunk
-      const proxyUrl = `${base}/u/${token}/proxy/${trackId}`;
-      return json({ url: proxyUrl, format: 'mp3', quality: result.quality });
+      const proxyUrl  = `${base}/u/${token}/proxy/${trackId}`;
+      // v1.5.0: return real format + expiresAt
+      const streamFmt = result.quality === 'flac' ? 'flac' : 'mp3';
+      return json({ url: proxyUrl, format: streamFmt, quality: result.quality, expiresAt: result.expiresAt });
     }
   }
   // Free: 30-second official preview
@@ -334,7 +336,7 @@ async function handleProxy(request, trackId, entry, env) {
 
   let result = streamCacheGet(trackId);
   if (!result) {
-    result = await getPremiumStreamInfo(trackId, arl);
+    result = await getPremiumStreamInfo(trackId, arl, env);
     if (result) {
       streamCacheSet(trackId, result);
       // Cache expanded BF key separately so seeks don't need to re-expand
@@ -381,8 +383,9 @@ async function handleProxy(request, trackId, entry, env) {
     return new Response('CDN error: ' + cdnRes.status, { status: 502 });
   }
 
+  // v1.5.0: correct Content-Type for FLAC vs MP3
   const responseHeaders = {
-    'Content-Type': 'audio/mpeg',
+    'Content-Type': result.quality === 'flac' ? 'audio/flac' : 'audio/mpeg',
     'Accept-Ranges': 'bytes',
     'Cache-Control': 'no-store',
     ...CORS,
@@ -680,7 +683,7 @@ async function dzGw(method, params, arl, sid, apiToken) {
 
 // ─── Premium stream info ─────────────────────────────────────────────────────
 // Returns { url, blowfishKey, quality } — url is Blowfish-encrypted, must proxy+decrypt
-async function getPremiumStreamInfo(trackId, arl) {
+async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
   try {
     // ── Session cache: skip 3 serial Deezer gateway round-trips if warm ────
     const arlKey = arl.slice(0, 16); // use prefix as cache key (never store full ARL)
@@ -701,6 +704,19 @@ async function getPremiumStreamInfo(trackId, arl) {
     }
 
     if (!userId || userId === 0) return null;
+
+    // v1.5.0: Check Redis cache so all CF isolates share the same CDN URL
+    const redisCacheKey = `dz:stream:${trackId}`;
+    const cachedStream = await redisGet(env_ref, redisCacheKey);
+    if (cachedStream) {
+      try {
+        const cached = JSON.parse(cachedStream);
+        if (cached?.url) {
+          const expandedBfCached = (cached.cipher === 'BF_CBC_STRIPE') ? bfExpandKey(cached.blowfishKey || getBlowfishKey(String(trackId))) : null;
+          return { ...cached, expandedBf: expandedBfCached };
+        }
+      } catch {}
+    }
 
     const listRaw  = await dzGw('song.getListData', { sng_ids: [String(trackId)] }, arl, sid, apiToken);
     let song       = listRaw?.results?.data?.[0];
@@ -738,11 +754,12 @@ async function getPremiumStreamInfo(trackId, arl) {
           body: JSON.stringify({
             license_token: licenseToken,
             media: [
-              // Request NONE cipher first — unencrypted direct MP3 URL, no worker decryption needed
-              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_320' }] },
-              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_128' }] },
-              { type: 'FULL', formats: [{ cipher: 'NONE', format: 'MP3_64'  }] },
-              // BF_CBC_STRIPE fallback — still usable via proxy+decrypt
+              // v1.5.0: FLAC first, then MP3 fallbacks
+              { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'FLAC'    }] },
+              { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_320' }] },
+              { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_128' }] },
+              { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_64'  }] },
+              // BF_CBC_STRIPE fallback
               { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
             ],
             track_tokens: [TRACK_TOKEN],
@@ -755,16 +772,13 @@ async function getPremiumStreamInfo(trackId, arl) {
           const s = item?.sources?.[0]?.url;
           if (s) {
             streamUrl    = s;
-            streamCipher = item?.cipher?.type || item?.format?.includes?.('BF') ? 'BF_CBC_STRIPE' : 'NONE';
-            // More reliable: check the format field from our request array
-            if (item.format) {
-              streamCipher = 'NONE'; // We requested NONE first — if we got a URL from the NONE formats it's plaintext
-              // But if it came from the BF fallback entry, mark it accordingly
-              // The safest heuristic: check if cipher object exists
-              if (item.cipher && item.cipher.type === 'BF_CBC_STRIPE') streamCipher = 'BF_CBC_STRIPE';
-            }
+            // v1.5.0: clean cipher detection
+            streamCipher = item?.cipher?.type || 'BF_CBC_STRIPE';
             const fmt = item.format || 'MP3_320';
-            quality = fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps';
+            quality = fmt.includes('FLAC') ? 'flac'
+                    : fmt.includes('320')  ? '320kbps'
+                    : fmt.includes('128')  ? '128kbps'
+                    : '64kbps';
             break;
           }
         }
@@ -801,9 +815,13 @@ async function getPremiumStreamInfo(trackId, arl) {
       return null;
     }
 
+    // v1.5.0: write to Redis (4min TTL) so other isolates reuse same URL
+    await redisSet(env_ref, `dz:stream:${trackId}`, JSON.stringify({ url: streamUrl, cipher: streamCipher, blowfishKey, quality }), 240);
+
     // Pre-expand BF key once here — only needed for BF_CBC_STRIPE streams
     const expandedBf = (streamCipher === 'BF_CBC_STRIPE') ? bfExpandKey(blowfishKey) : null;
-    return { url: streamUrl, cipher: streamCipher, blowfishKey, expandedBf, quality };
+    const expiresAt  = Date.now() + 240_000;
+    return { url: streamUrl, cipher: streamCipher, blowfishKey, expandedBf, quality, expiresAt };
 
   } catch (e) {
     console.error('[stream] Fatal:', e.message);
