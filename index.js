@@ -45,7 +45,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.3.0',
+        version: '1.4.0',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -242,7 +242,7 @@ function handleManifest(token, entry, base, env) {
   return json({
     id:          `com.eclipse.deezer.${token.slice(0, 8)}`,
     name:        hasPremium ? 'Deezer (Premium)' : 'Deezer (Previews)',
-    version:     '1.3.0',
+    version:     '1.4.0',
     description: hasPremium
       ? 'Full Deezer streaming.'
       : 'Deezer search + 30-second previews. Visit the addon page to upgrade to full tracks.',
@@ -355,41 +355,21 @@ async function handleProxy(request, trackId, entry, env) {
     return new Response('Decryption key unavailable, please retry', { status: 503 });
   }
 
-  // Pass Range header through so seeking/partial content works.
-  // For BF_CBC_STRIPE streams we MUST cap the range to prevent exceeding CF's 10ms CPU limit.
-  // Pure-JS Blowfish decryption is ~1ms per 100KB. Free Workers cap at 10ms CPU per request.
-  // We cap at 512KB (524288 bytes) per request — enough for ~5s of 128kbps audio per chunk.
-  // BF chunks must align to 2048-byte boundaries so we round down to the nearest 2048 multiple.
-  const BF_MAX_BYTES = 524288; // 512KB — safe ceiling for 10ms CPU budget
-  const BF_CHUNK_SIZE = 2048;
-
-  let rangeHeader = request.headers.get('Range');
+  // Pass the exact Range header from the client through unchanged — never cap it.
+  // CF Workers CPU limit applies per synchronous JS turn, NOT to total streaming time.
+  // The TransformStream processes incoming network chunks as they arrive (~16-64KB each),
+  // so each transform() call only decrypts a handful of BF blocks — well under 10ms per turn.
+  const rangeHeader = request.headers.get('Range');
   let byteStart = 0;
-
   if (rangeHeader) {
-    const m = rangeHeader.match(/bytes=(\d+)(?:-(\d+))?/);
-    if (m) {
-      byteStart = parseInt(m[1], 10);
-      const reqEnd = m[2] ? parseInt(m[2], 10) : null;
-      if (result.cipher === 'BF_CBC_STRIPE') {
-        // Cap the end to byteStart + BF_MAX_BYTES, aligned to 2048
-        const maxEnd = byteStart + BF_MAX_BYTES - 1;
-        const cappedEnd = reqEnd !== null ? Math.min(reqEnd, maxEnd) : maxEnd;
-        // Align end to 2048-byte chunk boundary (floor to last complete chunk)
-        const alignedEnd = (Math.floor((cappedEnd - byteStart + 1) / BF_CHUNK_SIZE) * BF_CHUNK_SIZE) + byteStart - 1;
-        const finalEnd = alignedEnd >= byteStart ? alignedEnd : cappedEnd;
-        rangeHeader = `bytes=${byteStart}-${finalEnd}`;
-        if (reqEnd !== null && reqEnd > finalEnd) {
-          console.log(`[proxy] BF range capped: ${reqEnd - byteStart + 1} → ${finalEnd - byteStart + 1} bytes for track ${trackId}`);
-        }
-      }
-    }
+    const m = rangeHeader.match(/bytes=(\d+)/);
+    if (m) byteStart = parseInt(m[1], 10);
   }
 
   const cdnHeaders = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
     'Accept': '*/*',
-    'Accept-Encoding': 'identity', // prevent gzip — compressed data can't be BF-decrypted chunk by chunk
+    'Accept-Encoding': 'identity', // prevent gzip — compressed bytes break chunk-aligned BF decrypt
     'Origin': 'https://www.deezer.com',
     'Referer': 'https://www.deezer.com/',
   };
@@ -414,7 +394,7 @@ async function handleProxy(request, trackId, entry, env) {
 
   // ── NONE cipher: stream is plaintext — pipe directly, no decryption ───────
   if (result.cipher === 'NONE' || !expandedBf) {
-    console.log(`[proxy] NONE cipher stream for track ${trackId} — piping directly (no BF decrypt)`);
+    console.log(`[proxy] NONE cipher — piping track ${trackId} directly`);
     return new Response(cdnRes.body, {
       status: cdnRes.status,
       headers: responseHeaders,
@@ -422,33 +402,37 @@ async function handleProxy(request, trackId, entry, env) {
   }
 
   // ── BF_CBC_STRIPE: stream-decrypt every 3rd 2048-byte chunk ──────────────
-  // byteStart is already computed above from the (possibly capped) range header
+  // chunkIndex tracks which 2048-byte block we're at globally so we know which to decrypt.
+  // Network delivers data in small chunks (~16-64KB), so each transform() call only does
+  // a handful of BF block operations — well within the 10ms CPU-per-turn budget.
   let chunkIndex = Math.floor(byteStart / 2048);
   let leftover   = new Uint8Array(0);
 
   const { readable, writable } = new TransformStream({
     transform(chunk, controller) {
-      const combined = new Uint8Array(leftover.length + chunk.length);
-      combined.set(leftover);
-      combined.set(chunk, leftover.length);
+      // Merge leftover bytes from previous call with new incoming chunk
+      const buf = new Uint8Array(leftover.length + chunk.length);
+      buf.set(leftover);
+      buf.set(chunk, leftover.length);
 
       let pos = 0;
-      while (pos + 2048 <= combined.length) {
-        const block = combined.slice(pos, pos + 2048);
+      while (pos + 2048 <= buf.length) {
+        const block = buf.subarray(pos, pos + 2048);
+        // Every 3rd chunk (0, 3, 6, ...) is BF-encrypted; the rest are plaintext
         if (chunkIndex % 3 === 0) {
           controller.enqueue(bfDecryptBlockFast(block, expandedBf));
         } else {
-          controller.enqueue(block);
+          controller.enqueue(new Uint8Array(block)); // copy to avoid shared buffer issues
         }
         chunkIndex++;
         pos += 2048;
       }
-      leftover = combined.slice(pos);
+      // Keep incomplete tail for next call
+      leftover = buf.slice(pos);
     },
     flush(controller) {
-      if (leftover.length > 0) {
-        controller.enqueue(leftover);
-      }
+      // Final partial block — always plaintext, flush as-is
+      if (leftover.length > 0) controller.enqueue(leftover);
     },
   });
 
@@ -1262,7 +1246,7 @@ footer{margin-top:32px;font-size:12px;color:#333;text-align:center;line-height:1
   <div class="warn">\u26a0\ufe0f ARL tokens are personal and tied to your Deezer account. They expire periodically \u2014 if full tracks stop playing, re-grab your ARL and generate a new URL. Never share your ARL publicly.</div>
 </div>
 
-<footer>Deezer Eclipse Addon v1.3.0 \u2014 <a href="${base}/health" target="_blank" style="color:#333">${base}</a></footer>
+<footer>Deezer Eclipse Addon v1.4.0 \u2014 <a href="${base}/health" target="_blank" style="color:#333">${base}</a></footer>
 
 <script>
 var _url = '';
