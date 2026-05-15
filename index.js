@@ -45,7 +45,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.5.5',
+        version: '1.5.6',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -397,10 +397,11 @@ async function handleProxy(request, trackId, entry, env) {
     return new Response(cdnRes.body, { status: cdnRes.status, headers: responseHeaders });
   }
 
-  // BF_CBC_STRIPE: expand key once (~5ms CPU), then stream-decrypt via TransformStream.
-  // Each transform() call processes one network chunk (~16-64KB = 8-32 BF blocks = ~0.1ms).
-  // Total CPU per request: ~5ms (expand) + ~0.2ms (decrypt) = well under 10ms limit.
-  const expandedBf = await bfExpandKey(bfKey);
+  // BF_CBC_STRIPE: v1.5.6 — bfExpandKey is synchronous.
+  // The await fetch(cdnUrl) above already reset CF's CPU timer via I/O.
+  // One extra setTimeout(0) gives a second CPU-counter reset before key expansion.
+  await new Promise(r => setTimeout(r, 0));
+  const expandedBf = bfExpandKey(bfKey);
 
   const rangeM   = rangeHeader?.match(/bytes=(\d+)/);
   let chunkIndex = rangeM ? Math.floor(parseInt(rangeM[1], 10) / 2048) : 0;
@@ -477,10 +478,10 @@ function bfDecryptBlock(data, keyStr) {
 }
 
 // ─── Pre-expand BF key ONCE per track — cache {P,S}, reuse across all range requests ─
-// v1.5.5: async bfExpandKey uses scheduler.yield() to split S-box setup across
-// multiple CPU time slices — keeps each slice under CF free plan's 10ms CPU limit.
-// The 512 S-box bfEncrypt calls are batched into groups of 32 pairs with a yield between each.
-async function bfExpandKey(keyStr) {
+// v1.5.6: bfExpandKey is synchronous. It runs AFTER the CDN fetch await,
+// which resets CF's CPU timer via I/O yield. A setTimeout(0) before calling
+// this gives one extra reset guarantee. No async needed, no TransformStream races.
+function bfExpandKey(keyStr) {
   const keyBytes = new Uint8Array(keyStr.length);
   for (let i = 0; i < keyStr.length; i++) keyBytes[i] = keyStr.charCodeAt(i);
   const P = BF_P.slice();
@@ -494,15 +495,9 @@ async function bfExpandKey(keyStr) {
   for (let i = 0; i < 18; i += 2) {
     [l, r] = bfEncrypt(l, r, P, S); P[i] = l; P[i+1] = r;
   }
-  // S-box setup: 4 boxes * 256 entries / 2 = 512 bfEncrypt calls.
-  // Yield every 32 pairs (64 entries) to stay under 10ms CPU per slice.
-  const yld = typeof scheduler !== 'undefined' && scheduler.yield
-    ? () => scheduler.yield()
-    : () => new Promise(r => setTimeout(r, 0));
   for (let b = 0; b < 4; b++) {
     for (let i = 0; i < 256; i += 2) {
       [l, r] = bfEncrypt(l, r, P, S); S[b][i] = l; S[b][i+1] = r;
-      if ((b * 128 + i / 2) % 32 === 31) await yld();
     }
   }
   return { P, S };
@@ -1285,9 +1280,23 @@ function copyUrl() {
 async function deezerGet(endpoint, params = {}) {
   const u = new URL(`${DEEZER_API}${endpoint}`);
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, String(v));
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Origin': 'https://www.deezer.com',
+    'Referer': 'https://www.deezer.com/',
+  };
   try {
-    const res = await fetch(u.toString());
+    const res = await fetch(u.toString(), {
+      headers,
+      cf: { cacheEverything: false, cacheTtl: 0 },
+    });
     const text = await res.text();
+    if (text.trimStart().startsWith('<')) {
+      console.error(`[deezerGet] ${endpoint} blocked (HTML), status=${res.status}`);
+      return {};
+    }
     return JSON.parse(text);
   } catch (e) {
     console.error(`[deezerGet] ${endpoint} failed:`, e.message);
