@@ -45,7 +45,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.5.3',
+        version: '1.5.4',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -309,20 +309,12 @@ async function handleStream(trackId, entry, env, token, base) {
     if (result?.url) {
       streamCacheSet(trackId, result);
       const streamFmt = result.quality === 'flac' ? 'flac' : 'mp3';
-      // v1.5.3: BF_CBC_STRIPE → return CDN URL directly + blowfishKey for client-side decrypt
-      //         NONE cipher   → return proxy URL (plain pipe, no decrypt needed)
-      if (result.cipher === 'BF_CBC_STRIPE') {
-        return json({
-          url:          result.url,
-          format:       streamFmt,
-          quality:      result.quality,
-          key:          result.blowfishKey,
-          cipher:       'BF_CBC_STRIPE',
-          expiresAt:    result.expiresAt,
-        });
-      }
-      // NONE cipher — proxy pipe
-      const proxyUrl = `${base}/u/${token}/proxy/${trackId}`;
+      // v1.5.4: Embed CDN URL + blowfishKey in proxy URL query params so /proxy needs no API call.
+      // /proxy decodes cdn+key from URL, calls bfExpandKey once, fetches+decrypts — no Deezer API hit.
+      const cdnB64 = btoa(result.url).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+      const proxyUrl = result.cipher === 'BF_CBC_STRIPE'
+        ? `${base}/u/${token}/proxy/${trackId}?cdn=${cdnB64}&k=${encodeURIComponent(result.blowfishKey)}`
+        : `${base}/u/${token}/proxy/${trackId}?cdn=${cdnB64}`;
       return json({ url: proxyUrl, format: streamFmt, quality: result.quality, expiresAt: result.expiresAt });
     }
   }
@@ -339,38 +331,44 @@ async function handleStream(trackId, entry, env, token, base) {
 // so CPU stays well within CF Workers' 10ms limit (only ~33% of chunks need BF work).
 // Range requests are passed through to the CDN so seeking works correctly.
 async function handleProxy(request, trackId, entry, env) {
-  const arl = entry.arl || (env.DEEZER_ARL || env.DEEZERARL) || null;
-  if (!arl) return new Response('No ARL configured', { status: 403 });
+  // v1.5.4: cdn URL and blowfishKey come from query params — no Deezer API call needed.
+  // /stream embeds them when building the proxy URL so each /proxy request is self-contained.
+  const reqUrl   = new URL(request.url);
+  const cdnB64   = reqUrl.searchParams.get('cdn');
+  const bfKey    = reqUrl.searchParams.get('k');
 
-  let result = streamCacheGet(trackId);
-  if (!result) {
-    result = await getPremiumStreamInfo(trackId, arl, env);
-    if (result) {
-      streamCacheSet(trackId, result);
-      // v1.5.2: bfKeyCacheSet skipped — NONE cipher only
-    }
-  }
-  if (!result?.url) {
-    console.error(`[proxy] No stream URL for track ${trackId}`);
-    return new Response('Track not available for streaming', { status: 404 });
+  // Fallback: if no cdn param (old client or direct call), resolve from stream cache or API
+  let cdnUrl, cipher, quality;
+  if (cdnB64) {
+    cdnUrl  = atob(cdnB64.replace(/-/g,'+').replace(/_/g,'/'));
+    cipher  = bfKey ? 'BF_CBC_STRIPE' : 'NONE';
+    quality = cdnUrl.includes('/flac/') || cdnUrl.includes('_FLAC') ? 'flac' : 'mp3';
+  } else {
+    const arl = entry.arl || (env.DEEZER_ARL || env.DEEZERARL) || null;
+    if (!arl) return new Response('No ARL configured', { status: 403 });
+    let result = streamCacheGet(trackId);
+    if (!result) result = await getPremiumStreamInfo(trackId, arl, env);
+    if (!result?.url) return new Response('Track not found', { status: 404 });
+    cdnUrl  = result.url;
+    cipher  = result.cipher;
+    quality = result.quality;
   }
 
-  // v1.5.1: Handle HEAD requests cheaply — just proxy CDN HEAD, no BF work
+  const rangeHeader = request.headers.get('Range');
+  const cdnHeaders = {
+    'User-Agent':      'Mozilla/5.0',
+    'Accept':          '*/*',
+    'Accept-Encoding': 'identity',
+    'Origin':          'https://www.deezer.com',
+    'Referer':         'https://www.deezer.com/',
+  };
+  if (rangeHeader) cdnHeaders['Range'] = rangeHeader;
+
+  // HEAD request — cheap probe, no decrypt needed
   if (request.method === 'HEAD') {
-    const headRes = await fetch(result.url, {
-      method: 'HEAD',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
-        'Accept': '*/*', 'Accept-Encoding': 'identity',
-        'Origin': 'https://www.deezer.com', 'Referer': 'https://www.deezer.com/',
-      },
-    });
-    const h = {
-      'Content-Type': result.quality === 'flac' ? 'audio/flac' : 'audio/mpeg',
-      'Accept-Ranges': 'bytes',
-      'Cache-Control': 'no-store',
-      ...CORS,
-    };
+    const headRes = await fetch(cdnUrl, { method: 'HEAD', headers: cdnHeaders });
+    const h = { 'Content-Type': quality === 'flac' ? 'audio/flac' : 'audio/mpeg',
+                'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store', ...CORS };
     const cl = headRes.headers.get('Content-Length');
     const cr = headRes.headers.get('Content-Range');
     if (cl) h['Content-Length'] = cl;
@@ -378,61 +376,57 @@ async function handleProxy(request, trackId, entry, env) {
     return new Response(null, { status: headRes.ok ? 200 : headRes.status, headers: h });
   }
 
-  const { url: cdnUrl } = result;
-  // v1.5.2: All streams are NONE cipher — no BF key expansion needed
-  const expandedBf = null; // kept for BF fallback 302 path only
-
-  // Pass the exact Range header from the client through unchanged — never cap it.
-  // CF Workers CPU limit applies per synchronous JS turn, NOT to total streaming time.
-  // The TransformStream processes incoming network chunks as they arrive (~16-64KB each),
-  // so each transform() call only decrypts a handful of BF blocks — well under 10ms per turn.
-  const rangeHeader = request.headers.get('Range');
-  let byteStart = 0;
-  if (rangeHeader) {
-    const m = rangeHeader.match(/bytes=(\d+)/);
-    if (m) byteStart = parseInt(m[1], 10);
-  }
-
-  const cdnHeaders = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
-    'Accept': '*/*',
-    'Accept-Encoding': 'identity', // prevent gzip — compressed bytes break chunk-aligned BF decrypt
-    'Origin': 'https://www.deezer.com',
-    'Referer': 'https://www.deezer.com/',
-  };
-  if (rangeHeader) cdnHeaders['Range'] = rangeHeader;
-
   const cdnRes = await fetch(cdnUrl, { headers: cdnHeaders });
   if (!cdnRes.ok && cdnRes.status !== 206) {
-    console.error(`[proxy] CDN fetch failed: ${cdnRes.status}`);
     return new Response('CDN error: ' + cdnRes.status, { status: 502 });
   }
 
-  // v1.5.0: correct Content-Type for FLAC vs MP3
   const responseHeaders = {
-    'Content-Type': result.quality === 'flac' ? 'audio/flac' : 'audio/mpeg',
+    'Content-Type':  quality === 'flac' ? 'audio/flac' : 'audio/mpeg',
     'Accept-Ranges': 'bytes',
     'Cache-Control': 'no-store',
     ...CORS,
   };
-  const cl  = cdnRes.headers.get('Content-Length');
-  const cr  = cdnRes.headers.get('Content-Range');
-  if (cl)  responseHeaders['Content-Length']  = cl;
-  if (cr)  responseHeaders['Content-Range']   = cr;
+  const cl = cdnRes.headers.get('Content-Length');
+  const cr = cdnRes.headers.get('Content-Range');
+  if (cl) responseHeaders['Content-Length'] = cl;
+  if (cr) responseHeaders['Content-Range']  = cr;
 
-  // v1.5.2: Primary path — NONE cipher, pipe CDN bytes directly to client
-  if (result.cipher === 'NONE' || !expandedBf) {
-    return new Response(cdnRes.body, {
-      status: cdnRes.status,
-      headers: responseHeaders,
-    });
+  // NONE cipher — pipe directly, zero CPU
+  if (cipher !== 'BF_CBC_STRIPE' || !bfKey) {
+    return new Response(cdnRes.body, { status: cdnRes.status, headers: responseHeaders });
   }
 
-  // v1.5.2: BF_CBC_STRIPE decrypt removed — too CPU-heavy for CF free plan (10ms limit).
-  // All streams are requested as NONE cipher so this path should never be reached.
-  // If somehow a BF stream slips through (e.g. CDN fallback), redirect client to CDN directly.
-  console.warn(`[proxy] BF_CBC_STRIPE stream for track ${trackId} — issuing 302 to CDN`);
-  return Response.redirect(cdnUrl, 302);
+  // BF_CBC_STRIPE: expand key once (~5ms CPU), then stream-decrypt via TransformStream.
+  // Each transform() call processes one network chunk (~16-64KB = 8-32 BF blocks = ~0.1ms).
+  // Total CPU per request: ~5ms (expand) + ~0.2ms (decrypt) = well under 10ms limit.
+  const expandedBf = bfExpandKey(bfKey);
+
+  const rangeM   = rangeHeader?.match(/bytes=(\d+)/);
+  let chunkIndex = rangeM ? Math.floor(parseInt(rangeM[1], 10) / 2048) : 0;
+  let leftover   = new Uint8Array(0);
+
+  const { readable, writable } = new TransformStream({
+    transform(chunk, controller) {
+      const buf = new Uint8Array(leftover.length + chunk.length);
+      buf.set(leftover);
+      buf.set(chunk, leftover.length);
+      let pos = 0;
+      while (pos + 2048 <= buf.length) {
+        const block = buf.subarray(pos, pos + 2048);
+        controller.enqueue(chunkIndex % 3 === 0
+          ? bfDecryptBlockFast(block, expandedBf)
+          : new Uint8Array(block));
+        chunkIndex++;
+        pos += 2048;
+      }
+      leftover = buf.slice(pos);
+    },
+    flush(controller) { if (leftover.length > 0) controller.enqueue(leftover); },
+  });
+
+  cdnRes.body.pipeTo(writable).catch(() => {});
+  return new Response(readable, { status: cdnRes.status, headers: responseHeaders });
 }
 
 // ─── Blowfish CBC decrypt a single 2048-byte block ───────────────────────────
