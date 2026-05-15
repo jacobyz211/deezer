@@ -45,7 +45,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.5.6',
+        version: '1.5.7',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -397,15 +397,39 @@ async function handleProxy(request, trackId, entry, env) {
     return new Response(cdnRes.body, { status: cdnRes.status, headers: responseHeaders });
   }
 
-  // BF_CBC_STRIPE: v1.5.6 — bfExpandKey is synchronous.
-  // The await fetch(cdnUrl) above already reset CF's CPU timer via I/O.
-  // One extra setTimeout(0) gives a second CPU-counter reset before key expansion.
-  await new Promise(r => setTimeout(r, 0));
-  const expandedBf = bfExpandKey(bfKey);
+  // v1.5.7: BF_CBC_STRIPE with 2048-byte range alignment fix + scheduler.yield key expansion.
+  //
+  // iOS sends non-2048-aligned Range seeks (e.g. bytes=727002-...).
+  // We must round the CDN request DOWN to the nearest 2048-byte boundary so that
+  // our chunk counter stays aligned with the file's actual BF stripe boundaries.
+  // The extra leading bytes are skipped before forwarding to the client.
+  const rangeM = rangeHeader?.match(/bytes=(\d+)(?:-(\d+))?/);
+  const clientStart  = rangeM ? parseInt(rangeM[1], 10) : 0;
+  const clientEnd    = rangeM && rangeM[2] ? parseInt(rangeM[2], 10) : null;
+  const alignedStart = Math.floor(clientStart / 2048) * 2048;
+  const alignOffset  = clientStart - alignedStart;   // bytes to skip at front
+  const chunkStart   = alignedStart / 2048;          // absolute chunk index
 
-  const rangeM   = rangeHeader?.match(/bytes=(\d+)/);
-  let chunkIndex = rangeM ? Math.floor(parseInt(rangeM[1], 10) / 2048) : 0;
+  // Re-fetch from aligned start if misaligned
+  let alignedRes = cdnRes;
+  if (alignOffset > 0) {
+    const alignedHeaders = {
+      'User-Agent':      'Mozilla/5.0',
+      'Accept':          '*/*',
+      'Accept-Encoding': 'identity',
+      'Origin':          'https://www.deezer.com',
+      'Referer':         'https://www.deezer.com/',
+      'Range': clientEnd !== null
+        ? `bytes=${alignedStart}-${clientEnd}`
+        : `bytes=${alignedStart}-`,
+    };
+    alignedRes = await fetch(cdnUrl, { headers: alignedHeaders });
+  }
+
+  const expandedBf = await bfExpandKey(bfKey);
+  let chunkIndex = chunkStart;
   let leftover   = new Uint8Array(0);
+  let skipped    = 0;  // bytes skipped so far to account for alignOffset
 
   const { readable, writable } = new TransformStream({
     transform(chunk, controller) {
@@ -415,19 +439,38 @@ async function handleProxy(request, trackId, entry, env) {
       let pos = 0;
       while (pos + 2048 <= buf.length) {
         const block = buf.subarray(pos, pos + 2048);
-        controller.enqueue(chunkIndex % 3 === 0
+        const decrypted = chunkIndex % 3 === 0
           ? bfDecryptBlockFast(block, expandedBf)
-          : new Uint8Array(block));
+          : new Uint8Array(block);
         chunkIndex++;
         pos += 2048;
+        // Skip leading alignOffset bytes so client gets data from clientStart onward
+        if (skipped < alignOffset) {
+          const need = alignOffset - skipped;
+          if (need >= decrypted.length) {
+            skipped += decrypted.length;
+            continue;
+          }
+          controller.enqueue(decrypted.subarray(need));
+          skipped = alignOffset;
+        } else {
+          controller.enqueue(decrypted);
+        }
       }
       leftover = buf.slice(pos);
     },
-    flush(controller) { if (leftover.length > 0) controller.enqueue(leftover); },
+    flush(controller) {
+      if (leftover.length > 0) {
+        const out = skipped < alignOffset
+          ? leftover.subarray(alignOffset - skipped)
+          : leftover;
+        if (out.length > 0) controller.enqueue(out);
+      }
+    },
   });
 
-  cdnRes.body.pipeTo(writable).catch(() => {});
-  return new Response(readable, { status: cdnRes.status, headers: responseHeaders });
+  alignedRes.body.pipeTo(writable).catch(() => {});
+  return new Response(readable, { status: alignedRes.status, headers: responseHeaders });
 }
 
 // ─── Blowfish CBC decrypt a single 2048-byte block ───────────────────────────
@@ -478,10 +521,10 @@ function bfDecryptBlock(data, keyStr) {
 }
 
 // ─── Pre-expand BF key ONCE per track — cache {P,S}, reuse across all range requests ─
-// v1.5.6: bfExpandKey is synchronous. It runs AFTER the CDN fetch await,
-// which resets CF's CPU timer via I/O yield. A setTimeout(0) before calling
-// this gives one extra reset guarantee. No async needed, no TransformStream races.
-function bfExpandKey(keyStr) {
+// v1.5.5: async bfExpandKey uses scheduler.yield() to split S-box setup across
+// multiple CPU time slices — keeps each slice under CF free plan's 10ms CPU limit.
+// The 512 S-box bfEncrypt calls are batched into groups of 32 pairs with a yield between each.
+async function bfExpandKey(keyStr) {
   const keyBytes = new Uint8Array(keyStr.length);
   for (let i = 0; i < keyStr.length; i++) keyBytes[i] = keyStr.charCodeAt(i);
   const P = BF_P.slice();
@@ -495,9 +538,15 @@ function bfExpandKey(keyStr) {
   for (let i = 0; i < 18; i += 2) {
     [l, r] = bfEncrypt(l, r, P, S); P[i] = l; P[i+1] = r;
   }
+  // S-box setup: 4 boxes * 256 entries / 2 = 512 bfEncrypt calls.
+  // Yield every 32 pairs (64 entries) to stay under 10ms CPU per slice.
+  const yld = typeof scheduler !== 'undefined' && scheduler.yield
+    ? () => scheduler.yield()
+    : () => new Promise(r => setTimeout(r, 0));
   for (let b = 0; b < 4; b++) {
     for (let i = 0; i < 256; i += 2) {
       [l, r] = bfEncrypt(l, r, P, S); S[b][i] = l; S[b][i+1] = r;
+      if ((b * 128 + i / 2) % 32 === 31) await yld();
     }
   }
   return { P, S };
