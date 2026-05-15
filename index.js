@@ -45,7 +45,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.5.4',
+        version: '1.5.5',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -400,7 +400,7 @@ async function handleProxy(request, trackId, entry, env) {
   // BF_CBC_STRIPE: expand key once (~5ms CPU), then stream-decrypt via TransformStream.
   // Each transform() call processes one network chunk (~16-64KB = 8-32 BF blocks = ~0.1ms).
   // Total CPU per request: ~5ms (expand) + ~0.2ms (decrypt) = well under 10ms limit.
-  const expandedBf = bfExpandKey(bfKey);
+  const expandedBf = await bfExpandKey(bfKey);
 
   const rangeM   = rangeHeader?.match(/bytes=(\d+)/);
   let chunkIndex = rangeM ? Math.floor(parseInt(rangeM[1], 10) / 2048) : 0;
@@ -477,7 +477,10 @@ function bfDecryptBlock(data, keyStr) {
 }
 
 // ─── Pre-expand BF key ONCE per track — cache {P,S}, reuse across all range requests ─
-function bfExpandKey(keyStr) {
+// v1.5.5: async bfExpandKey uses scheduler.yield() to split S-box setup across
+// multiple CPU time slices — keeps each slice under CF free plan's 10ms CPU limit.
+// The 512 S-box bfEncrypt calls are batched into groups of 32 pairs with a yield between each.
+async function bfExpandKey(keyStr) {
   const keyBytes = new Uint8Array(keyStr.length);
   for (let i = 0; i < keyStr.length; i++) keyBytes[i] = keyStr.charCodeAt(i);
   const P = BF_P.slice();
@@ -491,9 +494,15 @@ function bfExpandKey(keyStr) {
   for (let i = 0; i < 18; i += 2) {
     [l, r] = bfEncrypt(l, r, P, S); P[i] = l; P[i+1] = r;
   }
+  // S-box setup: 4 boxes * 256 entries / 2 = 512 bfEncrypt calls.
+  // Yield every 32 pairs (64 entries) to stay under 10ms CPU per slice.
+  const yld = typeof scheduler !== 'undefined' && scheduler.yield
+    ? () => scheduler.yield()
+    : () => new Promise(r => setTimeout(r, 0));
   for (let b = 0; b < 4; b++) {
     for (let i = 0; i < 256; i += 2) {
       [l, r] = bfEncrypt(l, r, P, S); S[b][i] = l; S[b][i+1] = r;
+      if ((b * 128 + i / 2) % 32 === 31) await yld();
     }
   }
   return { P, S };
