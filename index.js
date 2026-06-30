@@ -50,7 +50,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.6.1',
+        version: '1.6.2',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -247,7 +247,7 @@ function handleManifest(token, entry, base, env) {
   return json({
     id:          `com.eclipse.deezer.${token.slice(0, 8)}`,
     name:        hasPremium ? 'Deezer (Premium)' : 'Deezer (Previews)',
-    version:     '1.6.1',
+    version:     '1.6.2',
     description: hasPremium
       ? 'Full Deezer streaming.'
       : 'Deezer search + 30-second previews. Visit the addon page to upgrade to full tracks.',
@@ -270,37 +270,58 @@ async function handleSearch(url) {
     deezerGet('/search/playlist', { q, limit: 5  }),
   ]);
 
+  const tracks = (tracksRes.data || []).map(t => ({
+    id:         String(t.id),
+    title:      t.title,
+    artist:     t.artist?.name || '',
+    album:      t.album?.title || '',
+    duration:   t.duration,
+    artworkURL: t.album?.cover_xl || t.album?.cover_big || '',
+    thumbnail:  t.album?.cover_xl || t.album?.cover_big || '',
+    cover:      t.album?.cover_xl || t.album?.cover_big || '',
+    isrc:       t.isrc || '',
+    format:     'mp3',
+    type:       'track',
+  }));
+  const albums = (albumsRes.data || []).map(a => ({
+    id:         String(a.id),
+    title:      a.title,
+    artist:     a.artist?.name || '',
+    artworkURL: a.cover_xl || a.cover_big || '',
+    thumbnail:  a.cover_xl || a.cover_big || '',
+    cover:      a.cover_xl || a.cover_big || '',
+    trackCount: a.nb_tracks || 0,
+    year:       a.release_date ? parseInt(String(a.release_date).slice(0, 4), 10) : 0,
+    type:       'album',
+  }));
+  const artists = (artistsRes.data || []).map(a => ({
+    id:         String(a.id),
+    name:       a.name,
+    title:      a.name,
+    artworkURL: a.picture_xl || a.picture_big || '',
+    thumbnail:  a.picture_xl || a.picture_big || '',
+    cover:      a.picture_xl || a.picture_big || '',
+    type:       'artist',
+  }));
+  const playlists = (playlistsRes.data || []).map(p => ({
+    id:         String(p.id),
+    title:      p.title,
+    creator:    p.user?.name || '',
+    artworkURL: p.picture_xl || p.picture_big || '',
+    thumbnail:  p.picture_xl || p.picture_big || '',
+    cover:      p.picture_xl || p.picture_big || '',
+    trackCount: p.nb_tracks || 0,
+    type:       'playlist',
+  }));
+
   return json({
-    tracks: (tracksRes.data || []).map(t => ({
-      id:         String(t.id),
-      title:      t.title,
-      artist:     t.artist?.name || '',
-      album:      t.album?.title || '',
-      duration:   t.duration,
-      artworkURL: t.album?.cover_xl || t.album?.cover_big || '',
-      isrc:       t.isrc || '',
-      format:     'mp3',
-    })),
-    albums: (albumsRes.data || []).map(a => ({
-      id:         String(a.id),
-      title:      a.title,
-      artist:     a.artist?.name || '',
-      artworkURL: a.cover_xl || a.cover_big || '',
-      trackCount: a.nb_tracks || 0,
-      year:       a.release_date ? parseInt(String(a.release_date).slice(0, 4), 10) : 0,
-    })),
-    artists: (artistsRes.data || []).map(a => ({
-      id:         String(a.id),
-      name:       a.name,
-      artworkURL: a.picture_xl || a.picture_big || '',
-    })),
-    playlists: (playlistsRes.data || []).map(p => ({
-      id:         String(p.id),
-      title:      p.title,
-      creator:    p.user?.name || '',
-      artworkURL: p.picture_xl || p.picture_big || '',
-      trackCount: p.nb_tracks || 0,
-    })),
+    tracks,
+    albums,
+    artists,
+    playlists,
+    // Some Eclipse versions expect results wrapped under these keys too
+    results: { tracks, albums, artists, playlists },
+    total: tracks.length + albums.length + artists.length + playlists.length,
   });
 }
 
