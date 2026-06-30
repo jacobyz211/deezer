@@ -9,13 +9,15 @@
 const DEEZER_API = 'https://api.deezer.com';
 const CORS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, HEAD',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Range',
+  'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Content-Type, Accept-Ranges',
+  'Access-Control-Max-Age': '86400',
 };
 
 export default {
   async fetch(request, env) {
-    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...CORS, 'Vary': 'Origin, Access-Control-Request-Headers' } });
 
     const url  = new URL(request.url);
     const path = url.pathname.replace(/^\//, '');
@@ -48,7 +50,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.6.0',
+        version: '1.6.1',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -245,7 +247,7 @@ function handleManifest(token, entry, base, env) {
   return json({
     id:          `com.eclipse.deezer.${token.slice(0, 8)}`,
     name:        hasPremium ? 'Deezer (Premium)' : 'Deezer (Previews)',
-    version:     '1.6.0',
+    version:     '1.6.1',
     description: hasPremium
       ? 'Full Deezer streaming.'
       : 'Deezer search + 30-second previews. Visit the addon page to upgrade to full tracks.',
