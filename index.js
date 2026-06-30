@@ -1,6 +1,9 @@
 // ─── Deezer Eclipse Addon — Cloudflare Worker ────────────────────────────────
 // Free mode:    previews + full search — click Generate, no login needed
 // Premium mode: full 320kbps streams — input your Deezer ARL on the config page
+// v1.6.0 fixes: Redis-persisted sessions (survive CF isolate recycles), license_token
+//               auto-retry on stale cache, ARL-expiry error vs silent preview fallback,
+//               CDN 403/404 cache eviction so re-stream re-fetches fresh CDN URL.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DEEZER_API = 'https://api.deezer.com';
@@ -45,7 +48,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.5.7',
+        version: '1.6.0',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -125,7 +128,7 @@ function bfKeyCacheGet(trackId) { const e = BF_KEY_CACHE.get(trackId); if (!e) r
 // ─── ARL session cache (sid + apiToken + licenseToken) — 10 min TTL ──────────
 // Avoids 3 serial Deezer gateway round-trips (ping+getUserData+getListData) per play
 const SESSION_CACHE = new Map();
-function sessionCacheSet(arlKey, val) { SESSION_CACHE.set(arlKey, { val, exp: Date.now() + 600000 }); }
+function sessionCacheSet(arlKey, val) { SESSION_CACHE.set(arlKey, { val, exp: Date.now() + 2700000 }); } // 45min TTL
 function sessionCacheGet(arlKey) {
   const e = SESSION_CACHE.get(arlKey);
   if (!e) return null;
@@ -242,7 +245,7 @@ function handleManifest(token, entry, base, env) {
   return json({
     id:          `com.eclipse.deezer.${token.slice(0, 8)}`,
     name:        hasPremium ? 'Deezer (Premium)' : 'Deezer (Previews)',
-    version:     '1.4.0',
+    version:     '1.6.0',
     description: hasPremium
       ? 'Full Deezer streaming.'
       : 'Deezer search + 30-second previews. Visit the addon page to upgrade to full tracks.',
@@ -318,7 +321,14 @@ async function handleStream(trackId, entry, env, token, base) {
       return json({ url: proxyUrl, format: streamFmt, quality: result.quality, expiresAt: result.expiresAt });
     }
   }
-  // Free: 30-second official preview
+  // ── ARL configured but stream failed — distinguish expired ARL vs no ARL ──
+  const hasArl = !!(entry.arl || (env.DEEZER_ARL || env.DEEZERARL));
+  if (hasArl) {
+    // ARL is present but auth failed — return an explicit error so the user knows to refresh it.
+    // DO NOT silently fall to 30s preview; that's confusing and the wrong signal.
+    return json({ error: 'ARL session expired or invalid — please update your Deezer ARL.' }, 403);
+  }
+  // No ARL at all — free mode, serve official 30-second preview
   const track = await deezerGet(`/track/${trackId}`);
   if (track?.preview) return json({ url: track.preview, format: 'mp3', quality: 'preview_30s' });
   return json({ error: 'No stream available' }, 404);
@@ -378,6 +388,12 @@ async function handleProxy(request, trackId, entry, env) {
 
   const cdnRes = await fetch(cdnUrl, { headers: cdnHeaders });
   if (!cdnRes.ok && cdnRes.status !== 206) {
+    // CDN URL expired — evict from Redis stream cache so /stream re-fetches a fresh URL
+    if (cdnRes.status === 403 || cdnRes.status === 404) {
+      await redisSet(env, `dz:stream:${trackId}`, '', 1).catch(() => {});
+      STREAM_CACHE.delete(trackId);
+      console.log(`[proxy] CDN ${cdnRes.status} for track ${trackId} — evicted stream cache`);
+    }
     return new Response('CDN error: ' + cdnRes.status, { status: 502 });
   }
 
@@ -728,17 +744,35 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
     if (session) {
       ({ sid, apiToken, licenseToken, userId } = session);
     } else {
-      sid          = await dzPing(arl);
-      const userRaw = await dzGw('deezer.getUserData', {}, arl, sid, 'null');
-      apiToken     = userRaw?.results?.checkForm || 'null';
-      licenseToken = userRaw?.results?.USER?.OPTIONS?.license_token || null;
-      userId       = userRaw?.results?.USER?.USER_ID || 0;
-      if (userId && userId !== 0) {
-        sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
+      // Try Redis-persisted session before cold re-auth (survives CF isolate recycles)
+      const redisSess = await redisGet(env_ref, 'dz:sess:' + arlKey);
+      if (redisSess) {
+        try {
+          const rs = JSON.parse(redisSess);
+          if (rs?.userId && rs.userId !== 0) {
+            ({ sid, apiToken, licenseToken, userId } = rs);
+            sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
+          }
+        } catch {}
+      }
+      if (!userId) {
+        sid          = await dzPing(arl);
+        const userRaw = await dzGw('deezer.getUserData', {}, arl, sid, 'null');
+        apiToken     = userRaw?.results?.checkForm || 'null';
+        licenseToken = userRaw?.results?.USER?.OPTIONS?.license_token || null;
+        userId       = userRaw?.results?.USER?.USER_ID || 0;
+        if (userId && userId !== 0) {
+          sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
+          // Persist to Redis — 45min TTL so other isolates reuse it
+          await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 2700);
+        }
       }
     }
 
-    if (!userId || userId === 0) return null;
+    if (!userId || userId === 0) {
+      console.log('[stream] ARL invalid or expired — userId=0');
+      return { _arlExpired: true };
+    }
 
     // v1.5.0: Check Redis cache so all CF isolates share the same CDN URL
     const redisCacheKey = `dz:stream:${trackId}`;
@@ -815,6 +849,215 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
                     : fmt.includes('128')  ? '128kbps'
                     : '64kbps';
             break;
+          }
+        }
+        // If no URL returned, license_token may have expired — bust session cache and retry once
+        if (!streamUrl && mediaData?.errors?.length) {
+          console.log('[premium] media.deezer.com returned errors, busting session cache for retry:', JSON.stringify(mediaData.errors));
+          SESSION_CACHE.delete(arlKey);
+          await redisSet(env_ref, 'dz:sess:' + arlKey, '', 1); // expire Redis session too
+          // Retry auth fresh
+          sid          = await dzPing(arl);
+          const retryRaw = await dzGw('deezer.getUserData', {}, arl, sid, 'null');
+          apiToken     = retryRaw?.results?.checkForm || 'null';
+          licenseToken = retryRaw?.results?.USER?.OPTIONS?.license_token || null;
+          userId       = retryRaw?.results?.USER?.USER_ID || 0;
+          if (userId && userId !== 0 && licenseToken) {
+            sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
+            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 2700);
+            // Retry media.deezer.com with fresh license_token
+            try {
+              const retryMedia = await fetch('https://media.deezer.com/v1/get_url', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+                  'Cookie': `arl=${arl}; sid=${sid || ''}`,
+                  'Origin': 'https://www.deezer.com',
+                  'Referer': 'https://www.deezer.com/',
+                  'Accept': 'application/json, text/plain, */*',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                },
+                body: JSON.stringify({
+                  license_token: licenseToken,
+                  media: [
+                    { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'FLAC'    }] },
+                    { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_320' }] },
+                    { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_320' }] },
+                    { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
+                    { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_128' }] },
+                  ],
+                  track_tokens: [TRACK_TOKEN],
+                }),
+              });
+              const retryData = await retryMedia.json();
+              for (const item of (retryData?.data?.[0]?.media || [])) {
+                const s = item?.sources?.[0]?.url;
+                if (s) { streamUrl = s; streamCipher = item?.cipher?.type || 'BF_CBC_STRIPE'; const fmt = item.format || 'MP3_320'; quality = fmt.includes('FLAC') ? 'flac' : fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps'; break; }
+              }
+              console.log('[premium] retry media.deezer.com srcFound=' + !!streamUrl);
+            } catch(e2) { console.error('[premium] retry media error:', e2.message); }
+          }
+        }
+        // If no URL returned, license_token may have expired — bust session cache and retry once
+        if (!streamUrl && (mediaData?.errors?.length || !(mediaData?.data?.[0]?.media?.length))) {
+          console.log('[premium] media.deezer.com gave no URL, busting cache for re-auth retry');
+          SESSION_CACHE.delete(arlKey);
+          await redisSet(env_ref, 'dz:sess:' + arlKey, '', 1);
+          sid          = await dzPing(arl);
+          const retryRaw = await dzGw('deezer.getUserData', {}, arl, sid, 'null');
+          const retryApiToken  = retryRaw?.results?.checkForm || 'null';
+          const retryLicense   = retryRaw?.results?.USER?.OPTIONS?.license_token || null;
+          const retryUserId    = retryRaw?.results?.USER?.USER_ID || 0;
+          if (retryUserId && retryUserId !== 0 && retryLicense) {
+            apiToken     = retryApiToken;
+            licenseToken = retryLicense;
+            userId       = retryUserId;
+            sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
+            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 2700);
+            try {
+              const retryMedia = await fetch('https://media.deezer.com/v1/get_url', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+                  'Cookie': `arl=${arl}; sid=${sid || ''}`,
+                  'Origin': 'https://www.deezer.com',
+                  'Referer': 'https://www.deezer.com/',
+                  'Accept': 'application/json, text/plain, */*',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                },
+                body: JSON.stringify({
+                  license_token: licenseToken,
+                  media: [
+                    { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'FLAC'    }] },
+                    { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_320' }] },
+                    { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_320' }] },
+                    { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
+                    { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_128' }] },
+                  ],
+                  track_tokens: [TRACK_TOKEN],
+                }),
+              });
+              const retryData = await retryMedia.json();
+              for (const item of (retryData?.data?.[0]?.media || [])) {
+                const s = item?.sources?.[0]?.url;
+                if (s) {
+                  streamUrl    = s;
+                  streamCipher = item?.cipher?.type || 'BF_CBC_STRIPE';
+                  const fmt    = item.format || 'MP3_320';
+                  quality = fmt.includes('FLAC') ? 'flac' : fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps';
+                  break;
+                }
+              }
+              console.log('[premium] retry media.deezer.com srcFound=' + !!streamUrl);
+            } catch(e2) { console.error('[premium] retry media error:', e2.message); }
+          }
+        }
+        // If media.deezer.com returned no usable URL, license_token may be stale.
+        // Bust the in-memory + Redis session cache and retry auth once before giving up.
+        if (!streamUrl) {
+          console.log('[premium] media.deezer.com gave no URL — busting session cache, retrying auth once');
+          SESSION_CACHE.delete(arlKey);
+          await redisSet(env_ref, 'dz:sess:' + arlKey, '', 1); // immediately expire cached session
+          const retrySid = await dzPing(arl);
+          const retryRaw = await dzGw('deezer.getUserData', {}, arl, retrySid, 'null');
+          const retryLicense = retryRaw?.results?.USER?.OPTIONS?.license_token || null;
+          const retryUserId  = retryRaw?.results?.USER?.USER_ID || 0;
+          if (retryUserId && retryUserId !== 0 && retryLicense) {
+            const retryApiTok = retryRaw?.results?.checkForm || 'null';
+            sessionCacheSet(arlKey, { sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId });
+            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId }), 2700);
+            try {
+              const retryMRes = await fetch('https://media.deezer.com/v1/get_url', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+                  'Cookie': `arl=${arl}; sid=${retrySid || ''}`,
+                  'Origin': 'https://www.deezer.com',
+                  'Referer': 'https://www.deezer.com/',
+                  'Accept': 'application/json, text/plain, */*',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                },
+                body: JSON.stringify({
+                  license_token: retryLicense,
+                  media: [
+                    { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'FLAC'    }] },
+                    { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_320' }] },
+                    { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_320' }] },
+                    { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
+                    { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_128' }] },
+                  ],
+                  track_tokens: [TRACK_TOKEN],
+                }),
+              });
+              const retryMData = await retryMRes.json();
+              for (const item of (retryMData?.data?.[0]?.media || [])) {
+                const s = item?.sources?.[0]?.url;
+                if (s) {
+                  streamUrl    = s;
+                  streamCipher = item?.cipher?.type || 'BF_CBC_STRIPE';
+                  const fmt    = item.format || 'MP3_320';
+                  quality = fmt.includes('FLAC') ? 'flac' : fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps';
+                  break;
+                }
+              }
+              console.log('[premium] auth-retry media.deezer.com srcFound=' + !!streamUrl);
+            } catch(e2) { console.error('[premium] auth-retry media error:', e2.message); }
+          }
+        }
+        // If media.deezer.com returned no usable URL, license_token may be stale.
+        // Bust session cache and retry fresh auth once before falling to CDN reconstruction.
+        if (!streamUrl) {
+          console.log('[premium] media.deezer.com gave no URL — busting session, retrying auth');
+          SESSION_CACHE.delete(arlKey);
+          await redisSet(env_ref, 'dz:sess:' + arlKey, '', 1);
+          const retrySid = await dzPing(arl);
+          const retryRaw = await dzGw('deezer.getUserData', {}, arl, retrySid, 'null');
+          const retryLicense = retryRaw?.results?.USER?.OPTIONS?.license_token || null;
+          const retryUserId  = retryRaw?.results?.USER?.USER_ID || 0;
+          if (retryUserId && retryUserId !== 0 && retryLicense) {
+            const retryApiTok = retryRaw?.results?.checkForm || 'null';
+            sessionCacheSet(arlKey, { sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId });
+            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId }), 2700);
+            try {
+              const retryMRes = await fetch('https://media.deezer.com/v1/get_url', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+                  'Cookie': `arl=${arl}; sid=${retrySid || ''}`,
+                  'Origin': 'https://www.deezer.com',
+                  'Referer': 'https://www.deezer.com/',
+                  'Accept': 'application/json, text/plain, */*',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                },
+                body: JSON.stringify({
+                  license_token: retryLicense,
+                  media: [
+                    { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'FLAC'    }] },
+                    { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_320' }] },
+                    { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_320' }] },
+                    { type: 'FULL', formats: [{ cipher: 'BF_CBC_STRIPE', format: 'MP3_128' }] },
+                    { type: 'FULL', formats: [{ cipher: 'NONE',          format: 'MP3_128' }] },
+                  ],
+                  track_tokens: [TRACK_TOKEN],
+                }),
+              });
+              const retryMData = await retryMRes.json();
+              for (const item of (retryMData?.data?.[0]?.media || [])) {
+                const s = item?.sources?.[0]?.url;
+                if (s) {
+                  streamUrl    = s;
+                  streamCipher = item?.cipher?.type || 'BF_CBC_STRIPE';
+                  const fmt    = item.format || 'MP3_320';
+                  quality = fmt.includes('FLAC') ? 'flac' : fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps';
+                  break;
+                }
+              }
+              console.log('[premium] auth-retry media srcFound=' + !!streamUrl);
+            } catch(e2) { console.error('[premium] auth-retry media error:', e2.message); }
           }
         }
         console.log(`[premium] media.deezer.com srcFound=${!!streamUrl} cipher=${streamCipher} errors=${JSON.stringify(mediaData?.errors||null)}`);
