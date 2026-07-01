@@ -50,7 +50,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.6.2',
+        version: '1.6.3',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -247,7 +247,7 @@ function handleManifest(token, entry, base, env) {
   return json({
     id:          `com.eclipse.deezer.${token.slice(0, 8)}`,
     name:        hasPremium ? 'Deezer (Premium)' : 'Deezer (Previews)',
-    version:     '1.6.2',
+    version:     '1.6.3',
     description: hasPremium
       ? 'Full Deezer streaming.'
       : 'Deezer search + 30-second previews. Visit the addon page to upgrade to full tracks.',
@@ -270,58 +270,37 @@ async function handleSearch(url) {
     deezerGet('/search/playlist', { q, limit: 5  }),
   ]);
 
-  const tracks = (tracksRes.data || []).map(t => ({
-    id:         String(t.id),
-    title:      t.title,
-    artist:     t.artist?.name || '',
-    album:      t.album?.title || '',
-    duration:   t.duration,
-    artworkURL: t.album?.cover_xl || t.album?.cover_big || '',
-    thumbnail:  t.album?.cover_xl || t.album?.cover_big || '',
-    cover:      t.album?.cover_xl || t.album?.cover_big || '',
-    isrc:       t.isrc || '',
-    format:     'mp3',
-    type:       'track',
-  }));
-  const albums = (albumsRes.data || []).map(a => ({
-    id:         String(a.id),
-    title:      a.title,
-    artist:     a.artist?.name || '',
-    artworkURL: a.cover_xl || a.cover_big || '',
-    thumbnail:  a.cover_xl || a.cover_big || '',
-    cover:      a.cover_xl || a.cover_big || '',
-    trackCount: a.nb_tracks || 0,
-    year:       a.release_date ? parseInt(String(a.release_date).slice(0, 4), 10) : 0,
-    type:       'album',
-  }));
-  const artists = (artistsRes.data || []).map(a => ({
-    id:         String(a.id),
-    name:       a.name,
-    title:      a.name,
-    artworkURL: a.picture_xl || a.picture_big || '',
-    thumbnail:  a.picture_xl || a.picture_big || '',
-    cover:      a.picture_xl || a.picture_big || '',
-    type:       'artist',
-  }));
-  const playlists = (playlistsRes.data || []).map(p => ({
-    id:         String(p.id),
-    title:      p.title,
-    creator:    p.user?.name || '',
-    artworkURL: p.picture_xl || p.picture_big || '',
-    thumbnail:  p.picture_xl || p.picture_big || '',
-    cover:      p.picture_xl || p.picture_big || '',
-    trackCount: p.nb_tracks || 0,
-    type:       'playlist',
-  }));
-
   return json({
-    tracks,
-    albums,
-    artists,
-    playlists,
-    // Some Eclipse versions expect results wrapped under these keys too
-    results: { tracks, albums, artists, playlists },
-    total: tracks.length + albums.length + artists.length + playlists.length,
+    tracks: (tracksRes.data || []).map(t => ({
+      id:         String(t.id),
+      title:      t.title,
+      artist:     t.artist?.name || '',
+      album:      t.album?.title || '',
+      duration:   t.duration,
+      artworkURL: t.album?.cover_xl || t.album?.cover_big || '',
+      isrc:       t.isrc || '',
+      format:     'mp3',
+    })),
+    albums: (albumsRes.data || []).map(a => ({
+      id:         String(a.id),
+      title:      a.title,
+      artist:     a.artist?.name || '',
+      artworkURL: a.cover_xl || a.cover_big || '',
+      trackCount: a.nb_tracks || 0,
+      year:       a.release_date ? parseInt(String(a.release_date).slice(0, 4), 10) : 0,
+    })),
+    artists: (artistsRes.data || []).map(a => ({
+      id:         String(a.id),
+      name:       a.name,
+      artworkURL: a.picture_xl || a.picture_big || '',
+    })),
+    playlists: (playlistsRes.data || []).map(p => ({
+      id:         String(p.id),
+      title:      p.title,
+      creator:    p.user?.name || '',
+      artworkURL: p.picture_xl || p.picture_big || '',
+      trackCount: p.nb_tracks || 0,
+    })),
   });
 }
 
@@ -1595,22 +1574,49 @@ function copyUrl() {
 async function deezerGet(endpoint, params = {}) {
   const u = new URL(`${DEEZER_API}${endpoint}`);
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, String(v));
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+
+  // Rotate UA on each call to avoid Deezer IP-blocking specific Cloudflare colos
+  const UA_POOL = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0',
+  ];
+  const ua = UA_POOL[Math.floor(Math.random() * UA_POOL.length)];
+
+  const makeHeaders = (userAgent) => ({
+    'User-Agent': userAgent,
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
     'Origin': 'https://www.deezer.com',
     'Referer': 'https://www.deezer.com/',
-  };
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-site',
+  });
+
   try {
+    // First attempt
     const res = await fetch(u.toString(), {
-      headers,
+      headers: makeHeaders(ua),
       cf: { cacheEverything: false, cacheTtl: 0 },
     });
     const text = await res.text();
     if (text.trimStart().startsWith('<')) {
-      console.error(`[deezerGet] ${endpoint} blocked (HTML), status=${res.status}`);
-      return {};
+      console.error(`[deezerGet] ${endpoint} blocked (HTML) on first attempt, status=${res.status} — retrying with different UA`);
+      // Retry with a different UA immediately
+      const retryUa = UA_POOL.find(u => u !== ua) || UA_POOL[0];
+      const res2 = await fetch(u.toString(), {
+        headers: makeHeaders(retryUa),
+        cf: { cacheEverything: false, cacheTtl: 0 },
+      });
+      const text2 = await res2.text();
+      if (text2.trimStart().startsWith('<')) {
+        console.error(`[deezerGet] ${endpoint} blocked on retry too, status=${res2.status}`);
+        return {};
+      }
+      return JSON.parse(text2);
     }
     return JSON.parse(text);
   } catch (e) {
@@ -1618,6 +1624,7 @@ async function deezerGet(endpoint, params = {}) {
     return {};
   }
 }
+
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
