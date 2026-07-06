@@ -50,7 +50,7 @@ export default {
 
       if (path === 'health') return json({
         status: 'ok',
-        version: '1.6.3',
+        version: '1.6.4',
         arlConfigured: !!((env.DEEZER_ARL || env.DEEZERARL)),
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
@@ -415,7 +415,7 @@ async function handleProxy(request, trackId, entry, env) {
     return new Response(cdnRes.body, { status: cdnRes.status, headers: responseHeaders });
   }
 
-  // v1.5.7: BF_CBC_STRIPE with 2048-byte range alignment fix + scheduler.yield key expansion.
+  // v1.5.7: BF_CBC_STRIPE with 2048-byte range alignment fix. Key expansion is now synchronous (v1.6.4).
   //
   // iOS sends non-2048-aligned Range seeks (e.g. bytes=727002-...).
   // We must round the CDN request DOWN to the nearest 2048-byte boundary so that
@@ -444,7 +444,7 @@ async function handleProxy(request, trackId, entry, env) {
     alignedRes = await fetch(cdnUrl, { headers: alignedHeaders });
   }
 
-  const expandedBf = await bfExpandKey(bfKey);
+  const expandedBf = bfExpandKey(bfKey);
   let chunkIndex = chunkStart;
   let leftover   = new Uint8Array(0);
   let skipped    = 0;  // bytes skipped so far to account for alignOffset
@@ -542,7 +542,7 @@ function bfDecryptBlock(data, keyStr) {
 // v1.5.5: async bfExpandKey uses scheduler.yield() to split S-box setup across
 // multiple CPU time slices — keeps each slice under CF free plan's 10ms CPU limit.
 // The 512 S-box bfEncrypt calls are batched into groups of 32 pairs with a yield between each.
-async function bfExpandKey(keyStr) {
+function bfExpandKey(keyStr) {
   const keyBytes = new Uint8Array(keyStr.length);
   for (let i = 0; i < keyStr.length; i++) keyBytes[i] = keyStr.charCodeAt(i);
   const P = BF_P.slice();
@@ -556,15 +556,10 @@ async function bfExpandKey(keyStr) {
   for (let i = 0; i < 18; i += 2) {
     [l, r] = bfEncrypt(l, r, P, S); P[i] = l; P[i+1] = r;
   }
-  // S-box setup: 4 boxes * 256 entries / 2 = 512 bfEncrypt calls.
-  // Yield every 32 pairs (64 entries) to stay under 10ms CPU per slice.
-  const yld = typeof scheduler !== 'undefined' && scheduler.yield
-    ? () => scheduler.yield()
-    : () => new Promise(r => setTimeout(r, 0));
+  // S-box setup: synchronous — no scheduler.yield delays for instant stream start
   for (let b = 0; b < 4; b++) {
     for (let i = 0; i < 256; i += 2) {
       [l, r] = bfEncrypt(l, r, P, S); S[b][i] = l; S[b][i+1] = r;
-      if ((b * 128 + i / 2) % 32 === 31) await yld();
     }
   }
   return { P, S };
