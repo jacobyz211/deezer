@@ -25,6 +25,12 @@ var _spineBaseUrl = '__BASE_URL__';
 var _spineToken = null;
 var _spineTokenPromise = null;
 
+// Load persisted token from localStorage on module init
+try {
+  var _stored = localStorage.getItem('_deezer_spine_token');
+  if (_stored) _spineToken = _stored;
+} catch(e) {}
+
 function _spineEnsureToken() {
   if (_spineToken) return Promise.resolve(_spineToken);
   if (_spineTokenPromise) return _spineTokenPromise;
@@ -37,6 +43,8 @@ function _spineEnsureToken() {
     return r.json();
   }).then(function(d) {
     _spineToken = d.token || null;
+    // Persist so next load is instant
+    try { if (_spineToken) localStorage.setItem('_deezer_spine_token', _spineToken); } catch(e) {}
     return _spineToken;
   }).catch(function() { return null; });
   return _spineTokenPromise;
