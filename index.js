@@ -15,6 +15,160 @@ const CORS = {
   'Access-Control-Max-Age': '86400',
 };
 
+
+// ─── Deezer 8SPINE Module Code ─────────────────────────────────────────────────
+// Loaded by 8SPINE via: const createModule = new Function(code); createModule()
+// Must end with a top-level `return { id, ... }` — no IIFE wrapper.
+// __BASE_URL__ is replaced at serve-time with the actual deployment URL.
+const DEEZER_SPINE_MODULE_CODE = `
+var _spineBaseUrl = '__BASE_URL__';
+var _spineToken = null;
+var _spineTokenPromise = null;
+
+function _spineEnsureToken() {
+  if (_spineToken) return Promise.resolve(_spineToken);
+  if (_spineTokenPromise) return _spineTokenPromise;
+  _spineTokenPromise = fetch(_spineBaseUrl + '/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({})
+  }).then(function(r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function(d) {
+    _spineToken = d.token || null;
+    return _spineToken;
+  }).catch(function() { return null; });
+  return _spineTokenPromise;
+}
+
+function _spineFetch(path, params) {
+  var qs = '';
+  if (params) {
+    var keys = Object.keys(params);
+    if (keys.length) {
+      qs = '?' + keys.map(function(k) {
+        return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
+      }).join('&');
+    }
+  }
+  return fetch(_spineBaseUrl + path + qs, { headers: { 'Accept': 'application/json' } })
+    .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
+}
+
+async function _spineSearchTracks(query, limit) {
+  var lim = limit || 20;
+  var token = await _spineEnsureToken();
+  if (!token) return { tracks: [], total: 0 };
+  return _spineFetch('/u/' + token + '/search', { q: query, limit: lim })
+    .then(function(data) {
+      var tracks = (data.tracks || []).map(function(t) {
+        return {
+          id: token + '__' + t.id,
+          title: t.title || 'Unknown',
+          artist: t.artist || 'Unknown',
+          album: t.album || '',
+          duration: t.duration || 0,
+          albumCover: t.artworkURL || ''
+        };
+      });
+      return { tracks: tracks, total: tracks.length };
+    }).catch(function() { return { tracks: [], total: 0 }; });
+}
+
+async function _spineGetTrackStreamUrl(trackId, quality) {
+  var sep = trackId.indexOf('__');
+  if (sep === -1) return { streamUrl: null, track: { id: trackId, audioQuality: 'HIGH' } };
+  var token = trackId.slice(0, sep);
+  var deezerId = trackId.slice(sep + 2);
+  return _spineFetch('/u/' + token + '/stream/' + encodeURIComponent(deezerId), {})
+    .then(function(data) {
+      var aq = (data.quality === 'flac') ? 'LOSSLESS' : 'HIGH';
+      return {
+        streamUrl: data.url || null,
+        track: { id: trackId, audioQuality: aq }
+      };
+    }).catch(function() {
+      return { streamUrl: null, track: { id: trackId, audioQuality: 'HIGH' } };
+    });
+}
+
+async function _spineGetAlbum(albumId) {
+  var token = await _spineEnsureToken();
+  if (!token) return { album: null, tracks: [] };
+  var sep = albumId.indexOf('__');
+  var tok = sep !== -1 ? albumId.slice(0, sep) : token;
+  var aid = sep !== -1 ? albumId.slice(sep + 2) : albumId;
+  return _spineFetch('/u/' + tok + '/album/' + encodeURIComponent(aid), {})
+    .then(function(data) {
+      var tracks = (data.tracks || []).map(function(t) {
+        return {
+          id: tok + '__' + t.id,
+          title: t.title || 'Unknown',
+          artist: t.artist || data.artist || 'Unknown',
+          album: data.title || '',
+          duration: t.duration || 0,
+          albumCover: t.artworkURL || data.artworkURL || ''
+        };
+      });
+      return {
+        album: { id: albumId, title: data.title || 'Unknown', artist: data.artist || 'Unknown', cover: data.artworkURL || '', year: data.year ? String(data.year) : '' },
+        tracks: tracks
+      };
+    }).catch(function() { return { album: null, tracks: [] }; });
+}
+
+async function _spineGetArtist(artistId) {
+  var token = await _spineEnsureToken();
+  if (!token) return { artist: null, tracks: [], albums: [] };
+  var sep = artistId.indexOf('__');
+  var tok = sep !== -1 ? artistId.slice(0, sep) : token;
+  var aid = sep !== -1 ? artistId.slice(sep + 2) : artistId;
+  return _spineFetch('/u/' + tok + '/artist/' + encodeURIComponent(aid), {})
+    .then(function(data) {
+      var topTracks = (data.topTracks || []).map(function(t) {
+        return { id: tok + '__' + t.id, title: t.title || 'Unknown', artist: t.artist || data.name || 'Unknown', album: '', duration: t.duration || 0, albumCover: t.artworkURL || data.artworkURL || '' };
+      });
+      var albums = (data.albums || []).map(function(a) {
+        return { id: tok + '__' + a.id, title: a.title || 'Unknown', artist: a.artist || data.name || 'Unknown', cover: a.artworkURL || '', year: a.year ? String(a.year) : '' };
+      });
+      return {
+        artist: { id: artistId, name: data.name || 'Unknown', cover: data.artworkURL || '', bio: null },
+        tracks: topTracks,
+        albums: albums
+      };
+    }).catch(function() { return { artist: null, tracks: [], albums: [] }; });
+}
+
+return {
+  id: 'deezer-eclipse',
+  name: 'Deezer',
+  version: '1.6.4',
+  labels: ['MP3', '320kbps', 'FLAC', 'DEEZER'],
+  searchTracks: _spineSearchTracks,
+  getTrackStreamUrl: _spineGetTrackStreamUrl,
+  getAlbum: _spineGetAlbum,
+  getArtist: _spineGetArtist
+};
+`;
+
+function buildDeezerSpineJs(baseUrl) {
+  return DEEZER_SPINE_MODULE_CODE.replace(/__BASE_URL__/g, baseUrl);
+}
+
+// ─── Per-IP rate limiter for unauthenticated 8spine endpoints ─────────────────
+const IP_UNAUTH_RATE = new Map();
+const UNAUTH_MAX_PER_MIN = 10;
+function checkUnauthRateLimit(ip) {
+  const now = Date.now();
+  const b = IP_UNAUTH_RATE.get(ip) || { count: 0, resetAt: now + 60000 };
+  if (now > b.resetAt) { b.count = 0; b.resetAt = now + 60000; }
+  if (b.count >= UNAUTH_MAX_PER_MIN) return false;
+  b.count++;
+  IP_UNAUTH_RATE.set(ip, b);
+  return true;
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...CORS, 'Vary': 'Origin, Access-Control-Request-Headers' } });
@@ -55,6 +209,44 @@ export default {
         redisConfigured: !!((env.REDIS_URL  || env.REDISURL) && (env.REDIS_TOKEN || env.REDISTOKEN)),
         timestamp: new Date().toISOString(),
       });
+
+      // ── 8SPINE routes ───────────────────────────────────────────────────
+      if (path === '8spine' || path === '8spine/') {
+        const ip = (request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || 'unknown').split(',')[0].trim();
+        if (!checkUnauthRateLimit(ip)) return json({ error: 'Rate limit exceeded.' }, 429);
+        return json({
+          id: 'deezer-eclipse',
+          name: 'Deezer',
+          author: 'Eclipse Addon',
+          version: '1.6.4',
+          description: 'Deezer search + streaming. Free 30s previews or full 320kbps/FLAC with your ARL.',
+          download: base + '/8spine.js'
+        });
+      }
+
+      if (path === '8spine.js') {
+        const ip = (request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || 'unknown').split(',')[0].trim();
+        if (!checkUnauthRateLimit(ip)) return json({ error: 'Rate limit exceeded.' }, 429);
+        return new Response(buildDeezerSpineJs(base), {
+          headers: { ...CORS, 'Content-Type': 'application/javascript; charset=utf-8' }
+        });
+      }
+
+      if (path === '8spine-source.json') {
+        const ip = (request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || 'unknown').split(',')[0].trim();
+        if (!checkUnauthRateLimit(ip)) return json({ error: 'Rate limit exceeded.' }, 429);
+        const ourEntry = {
+          id: 'deezer-eclipse',
+          name: 'Deezer',
+          author: 'Eclipse Addon',
+          version: '1.6.4',
+          description: 'Deezer search + streaming. Free 30s previews or full 320kbps/FLAC with your ARL.',
+          labels: ['MP3', '320kbps', 'FLAC', 'DEEZER'],
+          download: base + '/8spine.js'
+        };
+        return json({ 'category:music': [ourEntry] });
+      }
+
 
       // Debug route — shows full pipeline including media.deezer.com response
       // Usage: /debug/TRACK_ID  (only works if DEEZER_ARL env is set)
