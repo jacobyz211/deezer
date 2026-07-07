@@ -217,7 +217,7 @@ export default {
         return json({
           id: 'deezer-eclipse',
           name: 'Deezer',
-          author: 'Eclipse Addon',
+          author: 'Ricky',
           version: '1.6.4',
           description: 'Deezer search + streaming. Free 30s previews or full 320kbps/FLAC with your ARL.',
           download: base + '/8spine.js'
