@@ -238,7 +238,7 @@ export default {
         const ourEntry = {
           id: 'deezer-eclipse',
           name: 'Deezer',
-          author: 'Eclipse Addon',
+          author: 'Ricky',
           version: '1.6.4',
           description: 'Deezer search + streaming. Free 30s previews or full 320kbps/FLAC with your ARL.',
           labels: ['MP3', '320kbps', 'FLAC', 'DEEZER'],
