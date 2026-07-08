@@ -1,8 +1,8 @@
 // ─── Deezer Eclipse Addon — Cloudflare Worker ────────────────────────────────
 // Free mode:    previews + full search — click Generate, no login needed
 // Premium mode: full 320kbps streams — input your Deezer ARL on the config page
-// v1.6.0 fixes: Redis-persisted sessions (survive CF isolate recycles), license_token
-//               auto-retry on stale cache, ARL-expiry error vs silent preview fallback,
+// v1.7.0 perf: pre-warm session on /generate, in-flight dedup, BF-key Redis cache,
+//              stream TTL 240s→3600s, session TTL 2700s→7200s, instant seek decrypt.
 //               CDN 403/404 cache eviction so re-stream re-fetches fresh CDN URL.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -324,13 +324,14 @@ const TOKEN_CACHE = new Map();
 const STREAM_CACHE = new Map();
 // Long-lived BF key cache — pre-expanded keys persist 10min independent of stream URL expiry
 const BF_KEY_CACHE = new Map();
+const IN_FLIGHT     = new Map(); // dedup concurrent stream fetches for same trackId
 function bfKeyCacheSet(trackId, expandedBf) { BF_KEY_CACHE.set(trackId, { expandedBf, exp: Date.now() + 600000 }); }
 function bfKeyCacheGet(trackId) { const e = BF_KEY_CACHE.get(trackId); if (!e) return null; if (Date.now() > e.exp) { BF_KEY_CACHE.delete(trackId); return null; } return e.expandedBf; }
 
 // ─── ARL session cache (sid + apiToken + licenseToken) — 10 min TTL ──────────
 // Avoids 3 serial Deezer gateway round-trips (ping+getUserData+getListData) per play
 const SESSION_CACHE = new Map();
-function sessionCacheSet(arlKey, val) { SESSION_CACHE.set(arlKey, { val, exp: Date.now() + 2700000 }); } // 45min TTL
+function sessionCacheSet(arlKey, val) { SESSION_CACHE.set(arlKey, { val, exp: Date.now() + 7200000 }); } // 45min TTL
 function sessionCacheGet(arlKey) {
   const e = SESSION_CACHE.get(arlKey);
   if (!e) return null;
@@ -422,6 +423,38 @@ async function saveToken(env, token, entry) {
 }
 
 // ─── Generate endpoint ───────────────────────────────────────────────────────
+// ─── Session pre-warmer ───────────────────────────────────────────────────────
+// Called fire-and-forget from /generate so the Deezer auth session is hot
+// in memory + Redis before the user ever presses play.
+async function prewarmSession(arl, env_ref) {
+  const arlKey = arl.slice(0, 16);
+  // Already warm — nothing to do
+  if (sessionCacheGet(arlKey)) return;
+  // Check Redis first
+  const redisSess = await redisGet(env_ref, 'dz:sess:' + arlKey);
+  if (redisSess) {
+    try {
+      const rs = JSON.parse(redisSess);
+      if (rs?.userId && rs.userId !== 0) {
+        sessionCacheSet(arlKey, rs);
+        return;
+      }
+    } catch {}
+  }
+  // Cold auth: ping + getUserData
+  const sid         = await dzPing(arl);
+  const userRaw     = await dzGw('deezer.getUserData', {}, arl, sid, 'null');
+  const apiToken    = userRaw?.results?.checkForm    || 'null';
+  const licenseToken = userRaw?.results?.USER?.OPTIONS?.license_token || null;
+  const userId      = userRaw?.results?.USER?.USER_ID || 0;
+  if (userId && userId !== 0) {
+    sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
+    await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 7200);
+    console.log('[prewarm] session cached for arlKey=' + arlKey);
+  }
+}
+
+
 async function handleGenerate(request, env, base) {
   const body = await request.json().catch(() => ({}));
   const arl  = body.arl ? String(body.arl).trim() : null;
@@ -431,11 +464,17 @@ async function handleGenerate(request, env, base) {
   }
 
   const token = generateToken();
-  // Store only user-supplied ARL in token — env ARL is always the fallback at stream time
   const entry = { arl: arl || null, createdAt: Date.now() };
   await saveToken(env, token, entry);
 
-  // Premium badge = user has own ARL OR server env ARL is set
+  // Pre-warm the Deezer session fire-and-forget so the FIRST play is instant.
+  // On cold isolate starts the 3 serial Deezer auth round-trips happen NOW (during
+  // token generation) rather than later when the user presses play.
+  const effectiveArl = arl || (env.DEEZER_ARL || env.DEEZERARL) || null;
+  if (effectiveArl) {
+    prewarmSession(effectiveArl, env).catch(() => {});
+  }
+
   const isPremium = !!(arl || (env.DEEZER_ARL || env.DEEZERARL));
   const manifestUrl = `${base}/u/${token}/manifest.json`;
   return json({ token, manifestUrl, premium: isPremium });
@@ -507,6 +546,19 @@ async function handleSearch(url) {
 // ─── Stream ──────────────────────────────────────────────────────────────────
 // Deezer BF_CBC_STRIPE streams are Blowfish-encrypted — every 3rd 2048-byte
 // chunk must be decrypted before playback. We fetch + decrypt + proxy inline.
+// ─── Quality label mapper ─────────────────────────────────────────────────────
+// Maps internal quality identifiers to the human-readable labels Eclipse
+// displays in the "Audio Quality" badge (e.g. 320kbps, 1411kbps, Preview).
+function qualityLabel(q) {
+  if (q === 'flac')        return '1411kbps';   // 16-bit/44.1kHz CD lossless
+  if (q === '320kbps')     return '320kbps';
+  if (q === '128kbps')     return '128kbps';
+  if (q === '64kbps')      return '64kbps';
+  if (q === 'preview_30s') return 'Preview (30s)';
+  return q;
+}
+
+
 async function handleStream(trackId, entry, env, token, base) {
   const arl = entry.arl || (env.DEEZER_ARL || env.DEEZERARL) || null;
   if (arl) {
@@ -520,7 +572,7 @@ async function handleStream(trackId, entry, env, token, base) {
       const proxyUrl = result.cipher === 'BF_CBC_STRIPE'
         ? `${base}/u/${token}/proxy/${trackId}?cdn=${cdnB64}&k=${encodeURIComponent(result.blowfishKey)}`
         : `${base}/u/${token}/proxy/${trackId}?cdn=${cdnB64}`;
-      return json({ url: proxyUrl, format: streamFmt, quality: result.quality, expiresAt: result.expiresAt });
+      return json({ url: proxyUrl, format: streamFmt, quality: qualityLabel(result.quality), expiresAt: result.expiresAt });
     }
   }
   // ── ARL configured but stream failed — distinguish expired ARL vs no ARL ──
@@ -532,7 +584,7 @@ async function handleStream(trackId, entry, env, token, base) {
   }
   // No ARL at all — free mode, serve official 30-second preview
   const track = await deezerGet(`/track/${trackId}`);
-  if (track?.preview) return json({ url: track.preview, format: 'mp3', quality: 'preview_30s' });
+  if (track?.preview) return json({ url: track.preview, format: 'mp3', quality: qualityLabel('preview_30s') });
   return json({ error: 'No stream available' }, 404);
 }
 
@@ -644,7 +696,12 @@ async function handleProxy(request, trackId, entry, env) {
     alignedRes = await fetch(cdnUrl, { headers: alignedHeaders });
   }
 
-  const expandedBf = bfExpandKey(bfKey);
+  // Use cached expanded key (survives seeks + isolate reuse) — only expand on first play
+  let expandedBf = BF_KEY_CACHE.has(trackId) ? BF_KEY_CACHE.get(trackId)?.expandedBf : null;
+  if (!expandedBf) {
+    expandedBf = bfExpandKey(bfKey);
+    bfKeyCacheSet(trackId, expandedBf);
+  }
   let chunkIndex = chunkStart;
   let leftover   = new Uint8Array(0);
   let skipped    = 0;  // bytes skipped so far to account for alignOffset
@@ -932,6 +989,17 @@ async function dzGw(method, params, arl, sid, apiToken) {
 // ─── Premium stream info ─────────────────────────────────────────────────────
 // Returns { url, blowfishKey, quality } — url is Blowfish-encrypted, must proxy+decrypt
 async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
+  // ── In-flight dedup: if the same trackId is already being fetched, wait for it ──
+  // This collapses rapid concurrent requests (e.g. Eclipse retrying) into a single
+  // Deezer API call chain, eliminating redundant auth + media.deezer.com requests.
+  const inflightKey = trackId + ':' + arl.slice(0, 16);
+  if (IN_FLIGHT.has(inflightKey)) {
+    try { return await IN_FLIGHT.get(inflightKey); } catch { /* fall through to fresh fetch */ }
+  }
+  let _resolve, _reject;
+  const inflightPromise = new Promise((res, rej) => { _resolve = res; _reject = rej; });
+  IN_FLIGHT.set(inflightKey, inflightPromise);
+  const _cleanup = () => IN_FLIGHT.delete(inflightKey);
   try {
     // ── Session cache: skip 3 serial Deezer gateway round-trips if warm ────
     const arlKey = arl.slice(0, 16); // use prefix as cache key (never store full ARL)
@@ -961,14 +1029,14 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
         if (userId && userId !== 0) {
           sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
           // Persist to Redis — 45min TTL so other isolates reuse it
-          await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 2700);
+          await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 7200);
         }
       }
     }
 
     if (!userId || userId === 0) {
       console.log('[stream] ARL invalid or expired — userId=0');
-      return { _arlExpired: true };
+      _resolve(null); _cleanup(); return { _arlExpired: true };
     }
 
     // v1.5.0: Check Redis cache so all CF isolates share the same CDN URL
@@ -1061,7 +1129,7 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
           userId       = retryRaw?.results?.USER?.USER_ID || 0;
           if (userId && userId !== 0 && licenseToken) {
             sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
-            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 2700);
+            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 7200);
             // Retry media.deezer.com with fresh license_token
             try {
               const retryMedia = await fetch('https://media.deezer.com/v1/get_url', {
@@ -1111,7 +1179,7 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
             licenseToken = retryLicense;
             userId       = retryUserId;
             sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
-            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 2700);
+            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 7200);
             try {
               const retryMedia = await fetch('https://media.deezer.com/v1/get_url', {
                 method: 'POST',
@@ -1164,7 +1232,7 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
           if (retryUserId && retryUserId !== 0 && retryLicense) {
             const retryApiTok = retryRaw?.results?.checkForm || 'null';
             sessionCacheSet(arlKey, { sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId });
-            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId }), 2700);
+            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId }), 7200);
             try {
               const retryMRes = await fetch('https://media.deezer.com/v1/get_url', {
                 method: 'POST',
@@ -1217,7 +1285,7 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
           if (retryUserId && retryUserId !== 0 && retryLicense) {
             const retryApiTok = retryRaw?.results?.checkForm || 'null';
             sessionCacheSet(arlKey, { sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId });
-            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId }), 2700);
+            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId }), 7200);
             try {
               const retryMRes = await fetch('https://media.deezer.com/v1/get_url', {
                 method: 'POST',
@@ -1278,20 +1346,22 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
 
     if (!streamUrl) {
       console.log('[premium] No stream URL available for track', trackId);
-      return null;
+      _resolve(null); _cleanup(); return null;
     }
 
     // v1.5.0: write to Redis (4min TTL) so other isolates reuse same URL
-    await redisSet(env_ref, `dz:stream:${trackId}`, JSON.stringify({ url: streamUrl, cipher: streamCipher, blowfishKey, quality }), 240);
+    await redisSet(env_ref, `dz:stream:${trackId}`, JSON.stringify({ url: streamUrl, cipher: streamCipher, blowfishKey, quality }), 3600);
 
     // v1.5.2: Skip bfExpandKey — NONE cipher, no decrypt in Worker
     const expandedBf = null;
-    const expiresAt  = Date.now() + 240_000;
-    return { url: streamUrl, cipher: streamCipher, blowfishKey, expandedBf, quality, expiresAt };
+    const expiresAt  = Date.now() + 3_600_000;
+    const result = { url: streamUrl, cipher: streamCipher, blowfishKey, expandedBf: null, quality, expiresAt };
+    _resolve(result); _cleanup();
+    return result;
 
   } catch (e) {
     console.error('[stream] Fatal:', e.message);
-    return null;
+    _reject(e); _cleanup(); return null;
   }
 }
 
