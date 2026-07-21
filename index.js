@@ -331,7 +331,7 @@ function bfKeyCacheGet(trackId) { const e = BF_KEY_CACHE.get(trackId); if (!e) r
 // ─── ARL session cache (sid + apiToken + licenseToken) — 10 min TTL ──────────
 // Avoids 3 serial Deezer gateway round-trips (ping+getUserData+getListData) per play
 const SESSION_CACHE = new Map();
-function sessionCacheSet(arlKey, val) { SESSION_CACHE.set(arlKey, { val, exp: Date.now() + 7200000 }); } // 45min TTL
+function sessionCacheSet(arlKey, val) { SESSION_CACHE.set(arlKey, { val, exp: Date.now() + 2400000 }); } // 40min TTL (was mislabeled 45min but actually set 2hr — fixed to match real Deezer session decay window)
 function sessionCacheGet(arlKey) {
   const e = SESSION_CACHE.get(arlKey);
   if (!e) return null;
@@ -449,7 +449,7 @@ async function prewarmSession(arl, env_ref) {
   const userId      = userRaw?.results?.USER?.USER_ID || 0;
   if (userId && userId !== 0) {
     sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
-    await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 7200);
+    await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 2400); // 40min, matches SESSION_CACHE TTL fix
     console.log('[prewarm] session cached for arlKey=' + arlKey);
   }
 }
@@ -1029,7 +1029,7 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
         if (userId && userId !== 0) {
           sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
           // Persist to Redis — 45min TTL so other isolates reuse it
-          await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 7200);
+          await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 2400); // 40min, matches SESSION_CACHE TTL fix
         }
       }
     }
@@ -1129,7 +1129,7 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
           userId       = retryRaw?.results?.USER?.USER_ID || 0;
           if (userId && userId !== 0 && licenseToken) {
             sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
-            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 7200);
+            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 2400); // 40min, matches SESSION_CACHE TTL fix
             // Retry media.deezer.com with fresh license_token
             try {
               const retryMedia = await fetch('https://media.deezer.com/v1/get_url', {
@@ -1179,7 +1179,7 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
             licenseToken = retryLicense;
             userId       = retryUserId;
             sessionCacheSet(arlKey, { sid, apiToken, licenseToken, userId });
-            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 7200);
+            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid, apiToken, licenseToken, userId }), 2400); // 40min, matches SESSION_CACHE TTL fix
             try {
               const retryMedia = await fetch('https://media.deezer.com/v1/get_url', {
                 method: 'POST',
@@ -1232,7 +1232,7 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
           if (retryUserId && retryUserId !== 0 && retryLicense) {
             const retryApiTok = retryRaw?.results?.checkForm || 'null';
             sessionCacheSet(arlKey, { sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId });
-            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId }), 7200);
+            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId }), 2400); // 40min, matches SESSION_CACHE TTL fix
             try {
               const retryMRes = await fetch('https://media.deezer.com/v1/get_url', {
                 method: 'POST',
@@ -1285,7 +1285,7 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
           if (retryUserId && retryUserId !== 0 && retryLicense) {
             const retryApiTok = retryRaw?.results?.checkForm || 'null';
             sessionCacheSet(arlKey, { sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId });
-            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId }), 7200);
+            await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid: retrySid, apiToken: retryApiTok, licenseToken: retryLicense, userId: retryUserId }), 2400); // 40min, matches SESSION_CACHE TTL fix
             try {
               const retryMRes = await fetch('https://media.deezer.com/v1/get_url', {
                 method: 'POST',
@@ -1347,6 +1347,87 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
     if (!streamUrl) {
       console.log('[premium] No stream URL available for track', trackId);
       _resolve(null); _cleanup(); return null;
+    }
+
+    // ── Quality guard: catch SILENT downgrade to 128kbps/64kbps ──────────────
+    // media.deezer.com does NOT always return an explicit error when the
+    // licenseToken has quietly decayed server-side — it just hands back a
+    // valid MP3_128 URL instead of FLAC/MP3_320. Without this check, that
+    // gets cached and served as if it were a successful high-quality stream.
+    // Force exactly ONE fresh re-auth + retry before accepting a low-quality
+    // result, so we can tell "session went stale" apart from "account is
+    // genuinely capped at 128kbps" (e.g. Free tier ARL).
+    if ((quality === '128kbps' || quality === '64kbps') && arl) {
+      console.log('[quality-guard] got', quality, 'despite ARL present — forcing session bust + retry for track', trackId);
+      SESSION_CACHE.delete(arlKey);
+      await redisSet(env_ref, 'dz:sess:' + arlKey, '', 1); // expire immediately
+
+      try {
+        const qgSid = await dzPing(arl);
+        const qgAuth = await dzGw('deezer.getUserData', {}, arl, qgSid, null);
+        const qgApiToken = qgAuth?.results?.checkForm ?? null;
+        const qgLicense = qgAuth?.results?.USER?.OPTIONS?.license_token ?? null;
+        const qgUserId = qgAuth?.results?.USER?.USER_ID ?? 0;
+
+        if (qgUserId && qgUserId !== 0 && qgLicense) {
+          sessionCacheSet(arlKey, { sid: qgSid, apiToken: qgApiToken, licenseToken: qgLicense, userId: qgUserId });
+          await redisSet(env_ref, 'dz:sess:' + arlKey,
+            JSON.stringify({ sid: qgSid, apiToken: qgApiToken, licenseToken: qgLicense, userId: qgUserId }),
+            2400);
+
+          const qgMediaRes = await fetch('https://media.deezer.com/v1/get_url', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+              'Cookie': `arl=${arl}; sid=${qgSid}`,
+              'Origin': 'https://www.deezer.com',
+              'Referer': 'https://www.deezer.com/',
+              'Accept': 'application/json, text/plain, */*',
+              'Accept-Language': 'en-US,en;q=0.9',
+            },
+            body: JSON.stringify({
+              license_token: qgLicense,
+              media: [{
+                type: 'FULL',
+                formats: [
+                  { cipher: 'BF_CBC_STRIPE', format: 'FLAC' },
+                  { cipher: 'BF_CBC_STRIPE', format: 'MP3_320' },
+                  { cipher: 'NONE', format: 'MP3_320' },
+                  { cipher: 'NONE', format: 'FLAC' },
+                  { cipher: 'BF_CBC_STRIPE', format: 'MP3_128' },
+                  { cipher: 'NONE', format: 'MP3_128' },
+                ],
+              }],
+              track_tokens: [TRACKTOKEN],
+            }),
+          });
+          const qgData = await qgMediaRes.json();
+          const qgItems = qgData?.data?.[0]?.media;
+          let qgUrl = null, qgCipher = 'BF_CBC_STRIPE', qgQuality = quality;
+          for (const item of (qgItems || [])) {
+            const s = item?.sources?.[0]?.url;
+            if (s) {
+              qgUrl = s;
+              qgCipher = item?.cipher?.type || 'BF_CBC_STRIPE';
+              const fmt = item.format || 'MP3_320';
+              qgQuality = fmt.includes('FLAC') ? 'flac' : fmt.includes('320') ? '320kbps' : fmt.includes('128') ? '128kbps' : '64kbps';
+              break;
+            }
+          }
+
+          if (qgUrl && qgQuality !== '128kbps' && qgQuality !== '64kbps') {
+            console.log('[quality-guard] retry succeeded, upgraded to', qgQuality, 'for track', trackId);
+            streamUrl = qgUrl;
+            streamCipher = qgCipher;
+            quality = qgQuality;
+          } else {
+            console.log('[quality-guard] retry still returned', qgQuality || quality, '— account likely capped at this tier, not a session bug');
+          }
+        }
+      } catch (qgErr) {
+        console.error('[quality-guard] retry attempt failed:', qgErr.message);
+      }
     }
 
     // v1.5.0: write to Redis (4min TTL) so other isolates reuse same URL
