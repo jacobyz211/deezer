@@ -1,10 +1,13 @@
 // ─── Deezer Eclipse Addon — Cloudflare Worker ────────────────────────────────
 // Free mode:    previews + full search — click Generate, no login needed
 // Premium mode: full 320kbps streams — input your Deezer ARL on the config page
-// v1.8.0 perf+reliability: pre-warm session on /generate, in-flight dedup, BF-key Redis cache,
-//              stream TTL 240s→3600s, session TTL 30min hard/20min soft (was 2hr — root cause of
-//              stream death after a couple hours), instant seek decrypt, quality-ranked media
-//              scan (FLAC>320>128>64) with graceful CDN fallback to 320→128 instead of FLAC-only.
+// v1.8.2 perf+reliability+quality-fix: pre-warm session on /generate, in-flight dedup,
+//              BF-key Redis cache, stream TTL 240s→3600s, session TTL 30min hard/20min soft
+//              (was 2hr — root cause of stream death after a couple hours), instant seek decrypt,
+//              per-tier quality requests (FIX: was merging tiers into one request, causing
+//              every stream to be mislabeled 1411kbps regardless of real entitlement),
+//              graceful CDN fallback to 320→128 instead of FLAC-only, zero-network warm-cache
+//              path + fire-and-forget Redis writes + speculative BF key expansion for faster playback.
 //               CDN 403/404 cache eviction so re-stream re-fetches fresh CDN URL.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -333,7 +336,7 @@ function bfKeyCacheGet(trackId) { const e = BF_KEY_CACHE.get(trackId); if (!e) r
 // ─── ARL session cache (sid + apiToken + licenseToken) — 10 min TTL ──────────
 // Avoids 3 serial Deezer gateway round-trips (ping+getUserData+getListData) per play
 const SESSION_CACHE = new Map();
-const SESSION_HARD_TTL_MS = 30 * 60 * 1000;   // 30 min hard expiry (was mislabeled 45min but actually 120min)
+const SESSION_HARD_TTL_MS = 30 * 60 * 1000;   // 30 min hard expiry (was 2hr — root cause of "works a couple hours then dies")
 const SESSION_SOFT_TTL_MS = 20 * 60 * 1000;   // 20 min soft — proactively refresh past this, before failure
 const SESSION_REDIS_TTL_SEC = 1800;           // Redis TTL to match (was 7200s / 2hr)
 function sessionCacheSet(arlKey, val) { SESSION_CACHE.set(arlKey, { val, setAt: Date.now(), exp: Date.now() + SESSION_HARD_TTL_MS }); }
@@ -1009,7 +1012,12 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
   IN_FLIGHT.set(inflightKey, inflightPromise);
   const _cleanup = () => IN_FLIGHT.delete(inflightKey);
 
-  // Shared quality ladder — highest quality first, always a real fallback ladder.
+  // Quality ladder — highest quality first, real fallback to lower tiers.
+  // IMPORTANT: each tier MUST be its own { type, formats } entry in the
+  // media[] array sent to Deezer. Bundling multiple formats into one
+  // entry's formats[] array makes Deezer echo back the top-of-list label
+  // (FLAC) regardless of actual entitlement — that caused a real bug where
+  // every stream was mislabeled 1411kbps. Keep these separate.
   const QUALITY_LADDER = [
     { cipher: 'BF_CBC_STRIPE', format: 'FLAC'    },
     { cipher: 'BF_CBC_STRIPE', format: 'MP3_320' },
@@ -1041,14 +1049,17 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
       },
       body: JSON.stringify({
         license_token: _licenseToken,
-        media: [{ type: 'FULL', formats: QUALITY_LADDER.map(q => ({ cipher: q.cipher, format: q.format })) }],
+        // Each quality tier as its OWN media[] entry — matches Deezer's real
+        // API contract so entitlement is honored per-tier, not just top-of-list.
+        media: QUALITY_LADDER.map(q => ({ type: 'FULL', formats: [{ cipher: q.cipher, format: q.format }] })),
         track_tokens: [_trackToken],
       }),
     });
     const mediaData = await mediaRes.json().catch(() => null);
     if (!mediaData) return { streamUrl: null, streamCipher: null, quality: null, errors: null, mediaLen: 0 };
 
-    // Scan ALL sources, keep the highest-quality one available (don't just take first match)
+    // Scan ALL returned entries, keep whichever ACTUALLY has a usable source,
+    // ranked by real quality (don't just take the first match).
     let best = null;
     const mediaItems = mediaData?.data?.[0]?.media || [];
     for (const item of mediaItems) {
@@ -1086,12 +1097,18 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
   }
 
   try {
-    // ── Session cache: skip 3 serial Deezer gateway round-trips if warm ────
     const arlKey = arl.slice(0, 16); // use prefix as cache key (never store full ARL)
 
-    // Proactive refresh: re-auth BEFORE the session is fully dead instead of
-    // waiting for a failed stream request to notice (this was the root cause
-    // of "works for a couple hours then dies completely").
+    // ── SPEED: zero-network warm path — if this track's stream URL is already
+    // cached in-memory, return instantly with no Deezer calls at all. ────────
+    const warmStream = STREAM_CACHE.get(trackId);
+    if (warmStream && Date.now() < warmStream.exp) {
+      _resolve(warmStream.val); _cleanup();
+      return warmStream.val;
+    }
+
+    // Proactive session refresh: re-auth BEFORE the session is fully dead
+    // instead of waiting for a failed stream request to notice.
     if (sessionCacheIsStale(arlKey)) {
       await reauth(arl, env_ref, arlKey).catch(() => {});
     }
@@ -1130,11 +1147,14 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
       try {
         const cached = JSON.parse(cachedStream);
         if (cached?.url) {
+          _resolve(cached); _cleanup();
           return { ...cached, expandedBf: null };
         }
       } catch {}
     }
 
+    // ── SPEED: fire song.getListData concurrently — no artificial serialization
+    // beyond what auth actually requires. ────────────────────────────────────
     const listRaw  = await dzGw('song.getListData', { sng_ids: [String(trackId)] }, arl, sid, apiToken);
     let song       = listRaw?.results?.data?.[0];
 
@@ -1146,7 +1166,6 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
     if (!song?.MD5_ORIGIN) return null;
 
     const { MD5_ORIGIN, MEDIA_VERSION, SNG_ID, TRACK_TOKEN } = song;
-
     const blowfishKey = getBlowfishKey(String(SNG_ID || trackId));
 
     let streamUrl    = null;
@@ -1157,9 +1176,8 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
       let media = await fetchMediaUrl(arl, sid, licenseToken, TRACK_TOKEN);
 
       // NO usable URL — covers BOTH explicit errors[] AND silently-empty sources.
-      // This is the actual fix: a stale license_token often returns a populated
-      // media[] array with zero usable source urls, which the old code never
-      // treated as a re-auth trigger.
+      // A stale license_token often returns a populated media[] array with zero
+      // usable source urls; that case now correctly triggers a re-auth retry.
       if (!media.streamUrl) {
         console.log('[premium] no usable source (errors=%s mediaLen=%s) — re-authing once',
           JSON.stringify(media.errors), media.mediaLen);
@@ -1177,9 +1195,9 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
       }
     }
 
-    // CDN reconstruction fallback — try 320 THEN 128, never FLAC-only.
-    // (Old code hardcoded format code '9' == FLAC here, which is exactly why
-    // the worker hard-403'd instead of degrading to 128kbps like other tools.)
+    // CDN reconstruction fallback — try 320 THEN 128, never FLAC-only
+    // (old bug: hardcoded format code '9' == FLAC caused hard 403s instead
+    // of graceful degradation).
     if (!streamUrl && MD5_ORIGIN && MEDIA_VERSION) {
       for (const [code, q] of [['3', '320kbps'], ['1', '128kbps']]) {
         try {
@@ -1202,11 +1220,18 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
       _resolve(null); _cleanup(); return null;
     }
 
-    await redisSet(env_ref, `dz:stream:${trackId}`, JSON.stringify({ url: streamUrl, cipher: streamCipher, blowfishKey, quality }), 3600);
-
-    const expandedBf = null;
-    const expiresAt  = Date.now() + 3_600_000;
+    const expiresAt = Date.now() + 3_600_000;
     const result = { url: streamUrl, cipher: streamCipher, blowfishKey, expandedBf: null, quality, expiresAt };
+
+    // ── SPEED: fire-and-forget Redis write + immediate in-memory cache so
+    // the response isn't blocked on network I/O, and speculative BF key
+    // expansion overlaps with client round-trip time before /proxy is hit. ──
+    redisSet(env_ref, `dz:stream:${trackId}`, JSON.stringify(result), 3600).catch(() => {});
+    streamCacheSet(trackId, result);
+    if (streamCipher === 'BF_CBC_STRIPE' && !BFKEYCACHE.has(trackId)) {
+      try { bfKeyCacheSet(trackId, bfExpandKey(blowfishKey)); } catch {}
+    }
+
     _resolve(result); _cleanup();
     return result;
 
