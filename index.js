@@ -331,12 +331,24 @@ function bfKeyCacheGet(trackId) { const e = BF_KEY_CACHE.get(trackId); if (!e) r
 // ─── ARL session cache (sid + apiToken + licenseToken) — 10 min TTL ──────────
 // Avoids 3 serial Deezer gateway round-trips (ping+getUserData+getListData) per play
 const SESSION_CACHE = new Map();
-function sessionCacheSet(arlKey, val) { SESSION_CACHE.set(arlKey, { val, exp: Date.now() + 2400000 }); } // 40min TTL (was mislabeled 45min but actually set 2hr — fixed to match real Deezer session decay window)
+const SESSION_HARD_TTL_MS   = 30 * 60 * 1000; // 30 min hard expiry
+const SESSION_SOFT_TTL_MS   = 20 * 60 * 1000; // 20 min soft — proactively refresh before hard expiry
+const SESSION_REDIS_TTL_SEC = 1800;           // Redis TTL matches hard expiry
+function sessionCacheSet(arlKey, val) { SESSION_CACHE.set(arlKey, { val, setAt: Date.now(), exp: Date.now() + SESSION_HARD_TTL_MS }); }
 function sessionCacheGet(arlKey) {
   const e = SESSION_CACHE.get(arlKey);
   if (!e) return null;
   if (Date.now() > e.exp) { SESSION_CACHE.delete(arlKey); return null; }
   return e.val;
+}
+// Root-cause fix: a cache entry can still be "valid" by hard-TTL but already
+// past the point where Deezer silently starts decaying it. Checking staleness
+// separately lets us refresh BEFORE a stream request fails, instead of only
+// reacting after Eclipse already got a bad/expired URL.
+function sessionCacheIsStale(arlKey) {
+  const e = SESSION_CACHE.get(arlKey);
+  if (!e) return true;
+  return (Date.now() - e.setAt) > SESSION_SOFT_TTL_MS;
 }
 
 function streamCacheSet(trackId, val) {
@@ -1003,8 +1015,29 @@ async function getPremiumStreamInfo(trackId, arl, env_ref = {}) {
   try {
     // ── Session cache: skip 3 serial Deezer gateway round-trips if warm ────
     const arlKey = arl.slice(0, 16); // use prefix as cache key (never store full ARL)
+
+    // Proactive refresh: re-auth BEFORE the cached session goes stale instead
+    // of waiting for a failed/downgraded stream request to notice. This is
+    // the actual fix for "works fine then dies after a couple hours" — the
+    // old code only ever re-authed reactively, after something already broke.
+    if (sessionCacheIsStale(arlKey)) {
+      try {
+        const freshSid   = await dzPing(arl);
+        const freshRaw   = await dzGw('deezer.getUserData', {}, arl, freshSid, 'null');
+        const freshApiToken   = freshRaw?.results?.checkForm || 'null';
+        const freshLicense    = freshRaw?.results?.USER?.OPTIONS?.license_token || null;
+        const freshUserId     = freshRaw?.results?.USER?.USER_ID || 0;
+        if (freshUserId && freshUserId !== 0) {
+          sessionCacheSet(arlKey, { sid: freshSid, apiToken: freshApiToken, licenseToken: freshLicense, userId: freshUserId });
+          await redisSet(env_ref, 'dz:sess:' + arlKey, JSON.stringify({ sid: freshSid, apiToken: freshApiToken, licenseToken: freshLicense, userId: freshUserId }), SESSION_REDIS_TTL_SEC);
+          console.log('[premium] proactive session refresh succeeded for arlKey=' + arlKey);
+        }
+      } catch (e) {
+        console.error('[premium] proactive refresh failed, falling back to reactive path:', e.message);
+      }
+    }
+
     let session = sessionCacheGet(arlKey);
-    let sid, apiToken, licenseToken, userId;
 
     if (session) {
       ({ sid, apiToken, licenseToken, userId } = session);
